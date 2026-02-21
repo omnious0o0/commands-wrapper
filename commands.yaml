@@ -1,0 +1,7 @@
+system --update:
+  description: "Quick system update"
+  steps 60:
+    - command: "sudo apt-get update"
+    - send: "<sudo-password>"
+    - command: "sudo apt-get upgrade -y"
+    - send: "<sudo-password>"

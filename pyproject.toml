@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commands-wrapper"
+version = "1.0"
+description = "commands-wrapper is a tool that allows you to wrap commands, and run them using a single command of your choice."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "omnious" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "pexpect>=4.8"
+]
+
+[tool.setuptools]
+script-files = [".commands-wrapper/commands-wrapper"]
