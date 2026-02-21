@@ -1,7 +1,7 @@
-system --update:
-  description: "Quick system update"
-  steps 60:
-    - command: "sudo apt-get update"
-    - send: "<sudo-password>"
-    - command: "sudo apt-get upgrade -y"
-    - send: "<sudo-password>"
+# command-name:
+#   description: "Description of the command" # required
+#   steps <NUM>: # <NUM> is timeout in seconds (optional)
+#     - command: "command to run" # required
+#     - send: "text to send to the command" # optional
+#     - press_key: "key to press" # optional
+#     - wait: "time to wait" # optional
