@@ -233,7 +233,7 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
                 except curses.error:
                     pass
 
-            h_hint = " TAB nav  ENTER line  Ctrl+S save  ESC cancel "
+            h_hint = " TAB nav  ENTER next  Ctrl+S save  ESC cancel "
             if focus_mode:
                 h_hint = f" [ FIELD {focus+1}/{len(fields)} ]  " + h_hint
             _addstr(win, h - 1, 2, h_hint.strip().center(w - 4), DIM())
@@ -293,14 +293,9 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
                     f.cur_x = 0
             elif key in (10, 13, curses.KEY_ENTER):
                 f = fields[focus]
-                if f.multiline:
-                    p, n = f.lines[f.cur_y][:f.cur_x], f.lines[f.cur_y][f.cur_x:]
-                    f.lines[f.cur_y] = p
-                    f.lines.insert(f.cur_y + 1, n)
-                    f.cur_y += 1
-                    f.cur_x = 0
-                else:
-                    focus = (focus + 1) % len(fields)
+                if focus == len(fields) - 1:
+                    return {field.key: field.get_value() for field in fields}
+                focus += 1
             elif key in (8, 127, curses.KEY_BACKSPACE):
                 f = fields[focus]
                 if f.cur_x > 0:
@@ -574,8 +569,8 @@ def _is_valid_name(name: str) -> bool:
 
 def _wizard_add(win):
     fields = [
-        Field("name", "Name"),
-        Field("desc", "Description", multiline=True, box_h=5),
+        Field("name", "Command"),
+        Field("desc", "Description"),
         Field("timeout", "Timeout in seconds (optional)"),
     ]
 
@@ -637,7 +632,7 @@ def _wizard_edit(win, db: Dict):
                 old_timeout = str(old_steps_key).replace('steps', '').strip()
 
                 fields = [
-                    Field("desc", "Description", value=cfg.get('description', ''), multiline=True, box_h=5),
+                    Field("desc", "Description", value=cfg.get('description', '')),
                     Field("timeout", "Timeout (seconds)", value=old_timeout),
                 ]
                 res = form_input(win, f"Edit metadata — {name}", fields)
