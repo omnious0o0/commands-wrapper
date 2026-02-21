@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "commands-wrapper"
 version = "1.0"
-description = "commands-wrapper is a tool that allows you to wrap commands, and run them using a single command of your choice."
+description = "commands-wrapper lets you wrap multi-step shell sequences into a single named command."
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [

@@ -2,101 +2,976 @@
 import os
 import sys
 import time
+import subprocess
+import curses
 import argparse
+import shlex
 import yaml
 import pexpect
 from typing import Dict, List, Any, Optional
 
-class Parser(argparse.ArgumentParser):
-    def exit(self, status=0, message=None):
-        if message: self._print_message(message, sys.stderr)
-        os._exit(status)
+ANSI_PRIMARY = "\033[38;5;67m"
+ANSI_MUTED = "\033[38;5;244m"
+ANSI_SUCCESS = "\033[38;5;108m"
+ANSI_ERROR = "\033[38;5;131m"
+ANSI_BOLD = "\033[1m"
+ANSI_RESET = "\033[0m"
+
+HEADER_TITLE = "commands-wrapper"
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, 67)
+    curses.init_pair(3, 244, -1)
+    curses.init_pair(4, 108, -1)
+    curses.init_pair(5, 131, -1)
+    curses.init_pair(6, 67, -1)
+
+SEL = lambda: curses.color_pair(1) | curses.A_BOLD
+DIM = lambda: curses.color_pair(3)
+OK  = lambda: curses.color_pair(4) | curses.A_BOLD
+ERR = lambda: curses.color_pair(5) | curses.A_BOLD
+HDR = lambda: curses.color_pair(6) | curses.A_BOLD
+
+def _addstr(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    max_len = w - x - 1
+    if max_len <= 0:
+        return
+    try:
+        win.addstr(y, x, text[:max_len], attr)
+    except curses.error:
+        pass
+
+def _draw_hline(win, y, x, n, char='─'):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    n = min(n, w - x)
+    if n > 0:
+        try:
+            win.addstr(y, x, char * n)
+        except curses.error:
+            pass
+
+def _draw_field_box_pad(pad, y, x, w, h, title: str, active: bool = False):
+    attr = HDR() if active else DIM()
+    try:
+        pad.attron(attr)
+        pad.addstr(y, x, "┌")
+        pad.addstr(y, x + w - 1, "┐")
+        pad.addstr(y + h - 1, x, "└")
+        pad.addstr(y + h - 1, x + w - 1, "┘")
+        _draw_hline(pad, y, x + 1, w - 2, '─')
+        _draw_hline(pad, y + h - 1, x + 1, w - 2, '─')
+        for i in range(1, h - 1):
+            pad.addstr(y + i, x, "│")
+            pad.addstr(y + i, x + w - 1, "│")
+        pad.attroff(attr)
+        _addstr(pad, y, x + 2, f" {title} ", HDR() if active else DIM())
+    except curses.error:
+        pass
+
+
+def _draw_header(win, title: str, compact: bool = False):
+    win.erase()
+    h, _ = win.getmaxyx()
+    y = 1
+    label = HEADER_TITLE.upper() if not compact and h > 18 else HEADER_TITLE
+    _addstr(win, y, 2, f" {label} ", HDR())
+    y += 2
+
+    _addstr(win, y, 4, title, curses.A_BOLD)
+    _draw_hline(win, y + 1, 4, len(title))
+    return y + 3
+
+
+def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]:
+    """Arrow-key navigable menu. Returns selected index or None if cancelled."""
+    cur = 0
+    while True:
+        y_offset = _draw_header(win, title)
+        h, w = win.getmaxyx()
+
+        for i, opt in enumerate(options):
+            row = y_offset + i
+            if row >= h - 3:
+                break
+            if i == cur:
+                _addstr(win, row, 4, f"  {opt}  ".ljust(40), SEL())
+            else:
+                _addstr(win, row, 6, opt, 0)
+
+        hint = " ↑↓ navigate   ENTER select   ESC back "
+        _addstr(win, h - 2, 2, hint, DIM())
+        if status:
+            _addstr(win, h - 3, 2, status, OK() if status.startswith("OK:") else ERR())
+
+        win.refresh()
+        key = win.getch()
+
+        if key in (curses.KEY_UP, ord('k')):
+            cur = (cur - 1) % len(options)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            cur = (cur + 1) % len(options)
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            return cur
+        elif key in (ord('q'), ord('Q'), 27):
+            return None
+
+
+class Field:
+    def __init__(self, key: str, label: str, value: str = "", multiline: bool = False, box_h: int = 3):
+        self.key = key
+        self.label = label
+        self.lines = [list(l) for l in str(value).split('\n')] if value else [[]]
+        self.cur_y = 0
+        self.cur_x = 0
+        self.view_y = 0
+        self.view_x = 0
+        self.multiline = multiline
+        self.box_h = box_h
+        self.top_y = 0
+
+    def get_value(self) -> str:
+        return "\n".join("".join(l) for l in self.lines).strip()
+
+
+def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]:
+    """Adaptive form engine. Switches between unified and focused modes based on available height."""
+    focus = 0
+    form_scroll = 0
+
+    prev_cursor = curses.curs_set(1)
+    try:
+        while True:
+            h, w = win.getmaxyx()
+            sw = w - 8
+
+            compact = (h < 26)
+            y_hdr = _draw_header(win, title, compact=compact)
+            avail_h = h - y_hdr - 3
+
+            total_field_h = sum(f.box_h + 1 for f in fields)
+            focus_mode = (total_field_h + 2 > avail_h)
+
+            ph = max(total_field_h + 10, h * 2)
+            pad = curses.newpad(ph, w)
+
+            py = 0
+            for i, f in enumerate(fields):
+                f.top_y = py if not focus_mode else 0
+                is_active = (i == focus)
+
+                if focus_mode and not is_active:
+                    continue
+
+                box_h = f.box_h
+                if focus_mode:
+                    box_h = max(f.box_h, min(avail_h, 10))
+
+                _draw_field_box_pad(pad, f.top_y, 4, sw, box_h, f.label, active=is_active)
+
+                fw = sw - 4
+                fh = box_h - 2
+
+                if is_active:
+                    if f.cur_y < f.view_y:
+                        f.view_y = f.cur_y
+                    elif f.cur_y >= f.view_y + fh:
+                        f.view_y = f.cur_y - fh + 1
+                    if f.cur_x < f.view_x:
+                        f.view_x = f.cur_x
+                    elif f.cur_x >= f.view_x + fw:
+                        f.view_x = f.cur_x - fw + 1
+
+                for r in range(fh):
+                    ridx = f.view_y + r
+                    if ridx < len(f.lines):
+                        line_data = "".join(f.lines[ridx])[f.view_x : f.view_x + fw]
+                        try:
+                            pad.addstr(f.top_y + 1 + r, 6, line_data)
+                        except curses.error:
+                            pass
+                        if f.view_x > 0:
+                            pad.addch(f.top_y + 1 + r, 5, "<", DIM())
+                        if len(f.lines[ridx]) > f.view_x + fw:
+                            pad.addch(f.top_y + 1 + r, 6 + fw, ">", DIM())
+
+                if not focus_mode:
+                    py += box_h + 1
+
+            if not focus_mode:
+                active_f = fields[focus]
+                if active_f.top_y < form_scroll:
+                    form_scroll = active_f.top_y
+                elif active_f.top_y + active_f.box_h > form_scroll + avail_h:
+                    form_scroll = active_f.top_y + active_f.box_h - avail_h
+            else:
+                form_scroll = 0
+
+            win.refresh()
+            r_y1, r_x1 = y_hdr, 0
+            r_y2, r_x2 = max(r_y1, h - 3), w - 1
+            try:
+                pad.refresh(form_scroll, 0, r_y1, r_x1, r_y2, r_x2)
+            except curses.error:
+                pass
+
+            active_f = fields[focus]
+            cy = y_hdr + (active_f.top_y - form_scroll) + 1 + (active_f.cur_y - active_f.view_y)
+            cx = 6 + (active_f.cur_x - active_f.view_x)
+            if 0 <= cy < h and 0 <= cx < w:
+                try:
+                    win.move(cy, cx)
+                except curses.error:
+                    pass
+
+            h_hint = " TAB nav  ENTER line  Ctrl+S save  ESC cancel "
+            if focus_mode:
+                h_hint = f" [ FIELD {focus+1}/{len(fields)} ]  " + h_hint
+            _addstr(win, h - 1, 2, h_hint.strip().center(w - 4), DIM())
+            win.refresh()
+
+            key = win.getch()
+
+            if key == 19:  # Ctrl+S
+                return {f.key: f.get_value() for f in fields}
+            elif key == 27:  # ESC or Alt+key
+                win.nodelay(True)
+                nk = win.getch()
+                win.nodelay(False)
+                if nk == -1:
+                    return None
+                if nk in (10, 13):  # Alt+Enter: insert newline in multiline fields
+                    f = fields[focus]
+                    if f.multiline:
+                        p, n = f.lines[f.cur_y][:f.cur_x], f.lines[f.cur_y][f.cur_x:]
+                        f.lines[f.cur_y] = p
+                        f.lines.insert(f.cur_y + 1, n)
+                        f.cur_y += 1
+                        f.cur_x = 0
+            elif key == 9:  # Tab
+                focus = (focus + 1) % len(fields)
+            elif key == curses.KEY_BTAB:
+                focus = (focus - 1) % len(fields)
+            elif key == curses.KEY_UP:
+                f = fields[focus]
+                if f.cur_y > 0:
+                    f.cur_y -= 1
+                    f.cur_x = min(f.cur_x, len(f.lines[f.cur_y]))
+                else:
+                    focus = (focus - 1) % len(fields)
+                    fields[focus].cur_y = len(fields[focus].lines) - 1
+            elif key == curses.KEY_DOWN:
+                f = fields[focus]
+                if f.cur_y < len(f.lines) - 1:
+                    f.cur_y += 1
+                    f.cur_x = min(f.cur_x, len(f.lines[f.cur_y]))
+                else:
+                    focus = (focus + 1) % len(fields)
+                    fields[focus].cur_y = 0
+            elif key == curses.KEY_LEFT:
+                f = fields[focus]
+                if f.cur_x > 0:
+                    f.cur_x -= 1
+                elif f.cur_y > 0:
+                    f.cur_y -= 1
+                    f.cur_x = len(f.lines[f.cur_y])
+            elif key == curses.KEY_RIGHT:
+                f = fields[focus]
+                if f.cur_x < len(f.lines[f.cur_y]):
+                    f.cur_x += 1
+                elif f.cur_y < len(f.lines) - 1:
+                    f.cur_y += 1
+                    f.cur_x = 0
+            elif key in (10, 13, curses.KEY_ENTER):
+                f = fields[focus]
+                if f.multiline:
+                    p, n = f.lines[f.cur_y][:f.cur_x], f.lines[f.cur_y][f.cur_x:]
+                    f.lines[f.cur_y] = p
+                    f.lines.insert(f.cur_y + 1, n)
+                    f.cur_y += 1
+                    f.cur_x = 0
+                else:
+                    focus = (focus + 1) % len(fields)
+            elif key in (8, 127, curses.KEY_BACKSPACE):
+                f = fields[focus]
+                if f.cur_x > 0:
+                    f.lines[f.cur_y].pop(f.cur_x - 1)
+                    f.cur_x -= 1
+                elif f.cur_y > 0:
+                    ol = len(f.lines[f.cur_y - 1])
+                    f.lines[f.cur_y - 1].extend(f.lines[f.cur_y])
+                    f.lines.pop(f.cur_y)
+                    f.cur_y -= 1
+                    f.cur_x = ol
+            elif key == curses.KEY_DC:
+                f = fields[focus]
+                if f.cur_x < len(f.lines[f.cur_y]):
+                    f.lines[f.cur_y].pop(f.cur_x)
+                elif f.cur_y < len(f.lines) - 1:
+                    f.lines[f.cur_y].extend(f.lines[f.cur_y + 1])
+                    f.lines.pop(f.cur_y + 1)
+            elif 32 <= key <= 126:
+                f = fields[focus]
+                f.lines[f.cur_y].insert(f.cur_x, chr(key))
+                f.cur_x += 1
+    finally:
+        curses.curs_set(prev_cursor)
+
+
+def _step_label(s: Dict) -> str:
+    if 'command' in s:
+        return f"  [COMMAND]  {s['command']}"
+    if 'send' in s:
+        return f"  [SEND]     {s['send']}"
+    if 'press_key' in s:
+        return f"  [KEY]      {s['press_key']}"
+    if 'wait' in s:
+        return f"  [WAIT]     {s['wait']}s"
+    return "  [UNKNOWN]  unsupported step"
+
+
+def steps_editor(win, initial_steps: List[Dict] = None) -> Optional[List[Dict]]:
+    """Interactive step timeline editor. Returns updated steps or None if cancelled."""
+    steps = list(initial_steps or [])
+    status = ""
+
+    while True:
+        labels = [_step_label(s) for s in steps]
+        labels.append("  + Add step")
+        labels.append("  Save and return")
+
+        choice = menu(win, "Step Timeline", labels, status)
+        status = ""
+
+        if choice is None:
+            return None
+
+        if choice == len(steps) + 1:
+            return steps
+
+        if choice == len(steps):
+            stype = menu(win, "Step type", [
+                "command   — run a shell command",
+                "send      — type text into running process",
+                "press_key — send a special key",
+                "wait      — pause execution",
+            ])
+            if stype is None:
+                continue
+
+            title = "Add step"
+            if stype == 0:
+                res = form_input(win, title, [Field("val", "Command:", multiline=True, box_h=7)])
+                if res and res["val"]:
+                    steps.append({"command": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 1:
+                res = form_input(win, title, [Field("val", "Text to send:", multiline=True, box_h=5)])
+                if res and res["val"]:
+                    steps.append({"send": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 2:
+                res = form_input(win, title, [Field("val", "Key (e.g. enter, tab, esc):")])
+                if res and res["val"]:
+                    steps.append({"press_key": res["val"]})
+                    status = "OK: Step added"
+            elif stype == 3:
+                res = form_input(win, title, [Field("val", "Duration (seconds):")])
+                if res and res["val"]:
+                    steps.append({"wait": res["val"]})
+                    status = "OK: Step added"
+
+        else:
+            action = menu(win, f"Step {choice + 1}: {_step_label(steps[choice]).strip()}", [
+                "Move up",
+                "Move down",
+                "Delete",
+                "Cancel",
+            ])
+            if action == 0 and choice > 0:
+                steps[choice], steps[choice - 1] = steps[choice - 1], steps[choice]
+                status = "OK: Moved up"
+            elif action == 1 and choice < len(steps) - 1:
+                steps[choice], steps[choice + 1] = steps[choice + 1], steps[choice]
+                status = "OK: Moved down"
+            elif action == 2:
+                steps.pop(choice)
+                status = "OK: Step removed"
 
 def find_yamls() -> List[str]:
     roots = [os.getcwd()]
-    try:
-        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if proj_root not in roots: roots.append(proj_root)
-    except: pass
-    
+    proj_root = os.path.dirname(_SCRIPT_DIR)
+    if proj_root not in roots:
+        roots.append(proj_root)
+
     found = []
     for r in roots:
-        paths = [os.path.join(r, 'commands.yaml'), os.path.join(r, 'commands.yml')]
+        candidates = [os.path.join(r, 'commands.yaml'), os.path.join(r, 'commands.yml')]
         for d in ('.commands-wrapper', 'commands-wrapper'):
             tgt = os.path.join(r, d)
             if os.path.isdir(tgt):
                 try:
-                    paths.extend(os.path.join(tgt, f) for f in os.listdir(tgt) if f.endswith(('.yaml', '.yml')) and not f.startswith('.'))
-                except PermissionError: pass
-        found.extend([p for p in set(paths) if os.path.isfile(p)])
-    return list(set(found))
+                    candidates.extend(
+                        os.path.join(tgt, f) for f in os.listdir(tgt)
+                        if f.endswith(('.yaml', '.yml')) and not f.startswith('.')
+                    )
+                except PermissionError:
+                    pass
+        found.extend(p for p in set(candidates) if os.path.isfile(p))
+    return sorted(dict.fromkeys(found))
 
-def load_cmds(files: List[str]) -> Dict[str, Any]:
+
+def _is_steps_key(key: Any) -> bool:
+    return str(key).startswith('steps')
+
+
+def _get_steps_key(cfg: Dict[str, Any]) -> Optional[str]:
+    return next((k for k in cfg if _is_steps_key(k)), None)
+
+
+def _parse_timeout(steps_key: str) -> Optional[int]:
+    parts = str(steps_key).split(maxsplit=1)
+    if len(parts) == 1:
+        return None
+    try:
+        timeout = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"invalid timeout in '{steps_key}'") from exc
+    if timeout <= 0:
+        raise ValueError(f"timeout must be positive in '{steps_key}'")
+    return timeout
+
+
+def _error(message: str) -> None:
+    sys.stderr.write(f"{ANSI_ERROR}Error:{ANSI_RESET} {message}\n")
+
+
+def _ok(message: str) -> None:
+    print(f"{ANSI_SUCCESS}{message}{ANSI_RESET}")
+
+
+def load_cmds(files: List[str]) -> Dict[str, Dict[str, Any]]:
     cmds = {}
     for f in files:
         try:
-            with open(f) as stream:
+            with open(f, encoding='utf-8') as stream:
                 data = yaml.safe_load(stream)
-                if not isinstance(data, dict): continue
-                for k, v in data.items():
-                    if isinstance(v, dict) and any(str(x).startswith('steps') for x in v):
-                        cmds[k] = v
-        except: pass
+        except OSError:
+            continue
+        except yaml.YAMLError:
+            continue
+
+        if not isinstance(data, dict):
+            continue
+
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            steps_key = _get_steps_key(v)
+            if not steps_key:
+                continue
+            if not isinstance(v.get(steps_key), list):
+                continue
+            v['_source'] = f
+            cmds[k] = v
     return cmds
 
-def run_step(proc: Optional[pexpect.spawn], ctx: Dict[str, Any], timeout: Optional[int]) -> Optional[pexpect.spawn]:
+
+def sync_binaries(db: Dict[str, Any], uninstall: bool = False):
+    import site
+    import stat
+    bin_dir = os.path.join(site.USER_BASE, 'bin')
+    os.makedirs(bin_dir, exist_ok=True)
+
+    expected = set()
+    if not uninstall:
+        expected = {'cw', 'command-wrapper'}
+        for k in db.keys():
+            base = str(k).split()[0] if str(k).strip() else ""
+            if base and all(c.isalnum() or c in '-_' for c in base):
+                expected.add(base)
+
+    try:
+        for f in os.listdir(bin_dir):
+            p = os.path.join(bin_dir, f)
+            if os.path.isfile(p):
+                try:
+                    with open(p, 'r') as fd:
+                        header = fd.read(50)
+                    if "COMMANDS-WRAPPER-GENERATED" in header and f not in expected:
+                        os.remove(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if uninstall:
+        return
+
+    wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else 'commands-wrapper'
+    wrapper_target_q = shlex.quote(wrapper_target)
+
+    for e in expected:
+        p = os.path.join(bin_dir, e)
+        if e in ('cw', 'command-wrapper'):
+            content = f"#!/usr/bin/env bash\n# COMMANDS-WRAPPER-GENERATED\nexec {wrapper_target_q} \"$@\"\n"
+        else:
+            content = f"#!/usr/bin/env bash\n# COMMANDS-WRAPPER-GENERATED\nexec {wrapper_target_q} \"{e}\" \"$@\"\n"
+        try:
+            with open(p, 'w') as fd:
+                fd.write(content)
+            st = os.stat(p)
+            os.chmod(p, st.st_mode | stat.S_IEXEC)
+        except Exception:
+            pass
+
+
+def save_cmd(name: str, cfg: Dict[str, Any], file_path: str):
+    data = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError):
+            pass
+    clean_cfg = {k: v for k, v in cfg.items() if k != '_source'}
+    data[name] = clean_cfg
+    with open(file_path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+    sync_binaries(load_cmds(find_yamls()))
+
+
+def remove_from_file(name: str, file_path: str) -> bool:
+    if not os.path.exists(file_path):
+        return False
+    try:
+        with open(file_path, encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+        if name in data:
+            del data[name]
+            with open(file_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(data, f, sort_keys=False)
+            sync_binaries(load_cmds(find_yamls()))
+            return True
+    except (OSError, yaml.YAMLError):
+        pass
+    return False
+
+
+def _is_valid_name(name: str) -> bool:
+    """Command names must be non-empty and contain only safe characters."""
+    return bool(name) and all(c.isalnum() or c in '-_ ' for c in name) and not name.isspace()
+
+
+def _wizard_add(win):
+    fields = [
+        Field("name", "Name"),
+        Field("desc", "Description", multiline=True, box_h=5),
+        Field("timeout", "Timeout in seconds (optional)"),
+    ]
+
+    while True:
+        res = form_input(win, "Add command", fields)
+        if not res:
+            return
+
+        name = res['name'].strip()
+        if not _is_valid_name(name):
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, "Invalid command name. Use letters, numbers, spaces, '-' or '_'.", ERR())
+            _addstr(win, y + 2, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        steps = steps_editor(win, [])
+        if steps is None:
+            return
+
+        timeout = res['timeout'].strip()
+        steps_key = f"steps {timeout}" if timeout else "steps"
+        target = os.path.join(os.getcwd(), 'commands.yaml')
+        save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
+        return
+
+
+def _wizard_edit(win, db: Dict):
+    while True:
+        if not db:
+            y = _draw_header(win, "Edit command")
+            _addstr(win, y, 4, "No commands found.", DIM())
+            win.refresh()
+            time.sleep(1.5)
+            return
+
+        keys = sorted(db.keys())
+        choice = menu(win, "Edit command", keys)
+        if choice is None:
+            return
+
+        name = keys[choice]
+        cfg = db[name]
+
+        while True:
+            action = menu(win, f"  {name}", [
+                "Edit metadata",
+                "Edit steps",
+                "Delete",
+                "Back",
+            ])
+
+            if action is None or action == 3:
+                break
+
+            if action == 0:
+                old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
+                old_timeout = str(old_steps_key).replace('steps', '').strip()
+
+                fields = [
+                    Field("desc", "Description", value=cfg.get('description', ''), multiline=True, box_h=5),
+                    Field("timeout", "Timeout (seconds)", value=old_timeout),
+                ]
+                res = form_input(win, f"Edit metadata — {name}", fields)
+                if not res:
+                    continue
+
+                cfg['description'] = res['desc'].strip()
+                timeout = res['timeout'].strip()
+                steps_key = f"steps {timeout}" if timeout else "steps"
+
+                if steps_key != old_steps_key:
+                    cfg[steps_key] = cfg.pop(old_steps_key)
+
+                save_cmd(name, cfg, cfg['_source'])
+
+            elif action == 1:
+                old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
+                existing_steps = cfg.get(old_steps_key, [])
+                steps = steps_editor(win, existing_steps)
+                if steps is not None:
+                    cfg[old_steps_key] = steps
+                    save_cmd(name, cfg, cfg['_source'])
+
+            elif action == 2:
+                confirm = menu(win, f"Delete '{name}'?", ["Cancel", "Delete"])
+                if confirm == 1:
+                    remove_from_file(name, cfg['_source'])
+                    del db[name]
+                    break
+
+
+def _wizard_main(win):
+    _init_colors()
+    curses.curs_set(0)
+    win.keypad(True)
+    win.timeout(-1)
+
+    while True:
+        db = load_cmds(find_yamls())
+        choice = menu(win, "What would you like to do?", [
+            "Add command",
+            "Edit commands",
+        ])
+
+        if choice is None:
+            break
+        elif choice == 0:
+            _wizard_add(win)
+        elif choice == 1:
+            _wizard_edit(win, db)
+
+
+def run_wizard():
+    try:
+        curses.wrapper(_wizard_main)
+    except KeyboardInterrupt:
+        pass
+
+
+def _run_pip(args: List[str], cwd: Optional[str] = None, suppress_output: bool = False) -> int:
+    base = [sys.executable, '-m', 'pip', *args]
+    kwargs: Dict[str, Any] = {'cwd': cwd}
+    if suppress_output:
+        kwargs['stdout'] = subprocess.DEVNULL
+        kwargs['stderr'] = subprocess.DEVNULL
+
+    with_break = subprocess.run([*base, '--break-system-packages'], **kwargs)
+    if with_break.returncode == 0:
+        return 0
+
+    fallback = subprocess.run(base, **kwargs)
+    return fallback.returncode
+
+
+def run_step(proc, ctx: Dict[str, Any], timeout):
     if 'command' in ctx:
         if proc and proc.isalive():
             proc.logfile_read = None
-            try: proc.interact()
-            except: pass
+            try:
+                proc.interact()
+            except Exception:
+                pass
             proc.close()
-        print(f"\n---> {ctx['command']}")
-        proc = pexpect.spawn(os.environ.get('SHELL', 'sh'), ['-c', ctx['command']], encoding='utf-8', timeout=timeout)
+        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{ctx['command']}")
+        proc = pexpect.spawn(
+            os.environ.get('SHELL', 'sh'),
+            ['-c', ctx['command']],
+            encoding='utf-8',
+            timeout=timeout,
+        )
         proc.logfile_read = sys.stdout
     elif 'send' in ctx and proc:
         proc.sendline(str(ctx['send']))
     elif 'press_key' in ctx and proc:
         k = str(ctx['press_key']).lower()
-        if k in ('enter', 'return'): proc.sendline()
-        elif k == 'tab': proc.send('\t')
-        elif k in ('esc', 'escape'): proc.send('\x1b')
-        else: proc.send(k)
+        if k in ('enter', 'return'):
+            proc.sendline()
+        elif k == 'tab':
+            proc.send('\t')
+        elif k in ('esc', 'escape'):
+            proc.send('\x1b')
+        else:
+            proc.send(k)
     elif 'wait' in ctx:
-        time.sleep(float(ctx['wait']))
+        try:
+            duration = float(ctx['wait'])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid wait duration: {ctx['wait']}") from exc
+        if duration < 0:
+            raise ValueError(f"wait duration must be non-negative: {ctx['wait']}")
+        time.sleep(duration)
     return proc
 
+
 def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
-    key = next((k for k in cfg if str(k).startswith('steps')), None)
-    if not key: return
-    t = int(str(key).split()[1]) if len(str(key).split()) > 1 else None
+    key = _get_steps_key(cfg)
+    if not key:
+        _error(f"'{name}' has no steps configured.")
+        sys.exit(1)
+
+    try:
+        t = _parse_timeout(key)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+    steps = cfg.get(key)
+    if not isinstance(steps, list):
+        _error(f"'{name}' has an invalid steps definition.")
+        sys.exit(1)
+
+    if not steps:
+        _error(f"'{name}' has no steps to execute.")
+        sys.exit(1)
+
     proc = None
-    for s in cfg[key]: proc = run_step(proc, s, t)
+    try:
+        for s in steps:
+            if not isinstance(s, dict):
+                raise ValueError(f"invalid step in '{name}': expected mapping")
+            proc = run_step(proc, s, t)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+    except pexpect.TIMEOUT:
+        _error(f"command '{name}' timed out.")
+        sys.exit(1)
+    except pexpect.EOF:
+        return
+
     if proc and proc.isalive():
         proc.logfile_read = None
-        try: proc.interact()
-        except: pass
+        try:
+            proc.interact()
+        except Exception:
+            pass
         proc.close()
 
+
+def print_list(db: Dict):
+    print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
+    if not db:
+        print(f"{ANSI_MUTED}No commands found.{ANSI_RESET}")
+        return
+    print(f"{ANSI_BOLD}{'NAME':<22} DESCRIPTION{ANSI_RESET}")
+    print(f"{ANSI_MUTED}{'-' * 72}{ANSI_RESET}")
+    for k, v in sorted(db.items()):
+        print(f"{ANSI_PRIMARY}{k:<22}{ANSI_RESET} {v.get('description', '')}")
+    print()
+
+
+def cmd_add_yaml(yaml_str: str):
+    try:
+        data = yaml.safe_load(yaml_str)
+        if not isinstance(data, dict):
+            raise ValueError("Input must be a YAML mapping.")
+        target = os.path.join(os.getcwd(), 'commands.yaml')
+        for name, cfg in data.items():
+            if not isinstance(cfg, dict):
+                continue
+            if not _is_valid_name(str(name).strip()):
+                _error(f"skipping '{name}': invalid command name")
+                continue
+            steps_key = _get_steps_key(cfg)
+            if not steps_key:
+                _error(f"skipping '{name}': no steps key found")
+                continue
+            if not isinstance(cfg.get(steps_key), list):
+                _error(f"skipping '{name}': steps value must be a list")
+                continue
+            try:
+                _parse_timeout(steps_key)
+            except ValueError as exc:
+                _error(f"skipping '{name}': {exc}")
+                continue
+            save_cmd(name, cfg, target)
+            _ok(f"Added '{name}' to {target}")
+    except Exception as e:
+        _error(f"YAML parse error: {e}")
+        sys.exit(1)
+
+
+def _pip_install():
+    location = _find_package_source()
+    if not location:
+        _error("cannot locate package source. Run 'pip install . --break-system-packages' from the project root.")
+        sys.exit(1)
+    return_code = _run_pip(['install', location], cwd=location)
+    sys.exit(return_code)
+
+
+def _pip_uninstall():
+    sync_binaries({}, uninstall=True)
+    return_code = _run_pip(['uninstall', 'commands-wrapper', '-y'])
+    if return_code == 0:
+        _ok("Uninstalled commands-wrapper.")
+    sys.exit(return_code)
+
+
+def _find_package_source() -> Optional[str]:
+    current = os.path.realpath(__file__)
+    for _ in range(3):
+        current = os.path.dirname(current)
+        if os.path.isfile(os.path.join(current, 'pyproject.toml')):
+            return current
+    candidate = os.path.dirname(_SCRIPT_DIR)
+    if os.path.isfile(os.path.join(candidate, 'pyproject.toml')):
+        return candidate
+    return None
+
+
+def _auto_update():
+    print(f"{ANSI_MUTED}Updating from GitHub...{ANSI_RESET}")
+    url = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
+    return_code = _run_pip(['install', '--upgrade', '--force-reinstall', url], suppress_output=True)
+    if return_code == 0:
+        sync_binaries(load_cmds(find_yamls()))
+        _ok("Update complete.")
+    else:
+        _error("update failed")
+    sys.exit(return_code)
+
+
+class _Parser(argparse.ArgumentParser):
+    def exit(self, status=0, message=None):
+        if message:
+            self._print_message(message, sys.stderr)
+        sys.exit(status)
+
+
 def main():
-    p = Parser(description="commands-wrapper automation engine.")
+    has_yaml_flag = "--yaml" in sys.argv
+    if has_yaml_flag:
+        sys.argv.remove("--yaml")
+
+    if sys.argv[1:] == ["--install"]:
+        _pip_install()
+
+    if sys.argv[1:] == ["--uninstall"]:
+        _pip_uninstall()
+
+    p = _Parser(description="Wrap multi-step shell sequences into a single named command.")
     p.add_argument("action", nargs=argparse.REMAINDER)
     args = p.parse_args()
-    if not args.action or args.action[0] in ('-h', '--help'):
+
+    action_parts = args.action
+
+    if not action_parts:
+        run_wizard()
+        return
+
+    action = action_parts[0]
+
+    if action in ('-h', '--help'):
         p.print_help()
-        os._exit(0 if args.action else 1)
-    
-    cmd = " ".join(args.action)
-    db = load_cmds(find_yamls())
-    
-    if cmd in ('ls', 'list'):
-        for k, v in db.items():
-            print(f"\n# {'-'*22} {k} {'-'*22}\n# {v.get('description', '')}\n# {'-'*(46+len(k))}")
-    elif cmd in db:
-        exec_cmd(cmd, db[cmd])
+
+    elif action in ('update', 'upd'):
+        _auto_update()
+
+    elif action in ('ls', 'list'):
+        db = load_cmds(find_yamls())
+        print_list(db)
+
+    elif action == 'hook':
+        print("alias cw='commands-wrapper'")
+        print("alias command-wrapper='commands-wrapper'")
+        db = load_cmds(find_yamls())
+        for k in sorted(db.keys()):
+            base = str(k).split()[0] if str(k).strip() else ""
+            if base and all(c.isalnum() or c in '-_' for c in base):
+                print(f"alias {base}='commands-wrapper {base}'")
+
+    elif action == 'sync':
+        db = load_cmds(find_yamls())
+        is_uninstall = "--uninstall" in sys.argv
+        sync_binaries(db, uninstall=is_uninstall)
+        if not is_uninstall:
+            _ok("Synced binary wrappers.")
+
+    elif action in ('configure', 'config'):
+        run_wizard()
+
+    elif action == 'add':
+        if not has_yaml_flag:
+            _error("Usage: commands-wrapper add --yaml <<EOF\\n...\\nEOF")
+            sys.exit(1)
+        yaml_content = sys.stdin.read()
+        if not yaml_content.strip():
+            _error("No YAML content on stdin.")
+            sys.exit(1)
+        cmd_add_yaml(yaml_content)
+
+    elif action in ('rm', 'remove'):
+        if len(action_parts) < 2:
+            _error(f"Usage: commands-wrapper {action} <name>")
+            sys.exit(1)
+        db = load_cmds(find_yamls())
+        name = action_parts[1]
+        if name not in db:
+            _error(f"'{name}' not found")
+            sys.exit(1)
+        if remove_from_file(name, db[name]['_source']):
+            _ok(f"Removed '{name}'.")
+
     else:
-        sys.stderr.write(f"Error: '{cmd}' not found.\n")
-        os._exit(1)
+        db = load_cmds(find_yamls())
+        full = " ".join(action_parts)
+        target = full if full in db else action if action in db else None
+        if target:
+            exec_cmd(target, db[target])
+        else:
+            _error(f"'{full}' not found")
+            sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

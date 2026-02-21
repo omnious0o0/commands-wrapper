@@ -1,16 +1,29 @@
 # commands-wrapper
 
-As the name implies, commands-wrapper is a tool that allows you to wrap commands, and run them using a single command of your choice.
+commands-wrapper lets you wrap multi-step shell sequences into a single named command.
 
 It's simple to interact with, and very powerful for automating repetitive tasks.
 
 ## installation
+
+**One-liner:**
 ```bash
-pip install . --break-system-packages
+curl -sSL https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh | bash
 ```
 
 ## usage
-Yaml format & options:
+
+### Interactive CLI (Quick & Easy)
+
+```bash
+commands-wrapper configure
+```
+
+**IMPORTANT:** To use the commands, you have 2 options:
+- <command-name> # make sure it doesn't conflict with any other command.
+- command-wrapper <command-name> # or `cw <command-name>` This ensures there are no conflicts.
+
+### YAML format
 ```yaml
 command-name:
   description: "Description of the command" # required
@@ -26,33 +39,61 @@ example:
 system --update:
   description: "Quick system update"
   steps 60:
-    - command: "sudo apt-get update"
-    - send: "<sudo-password>"
-    - command: "sudo apt-get upgrade -y"
+    - command: "sudo apt-get update && sudo apt-get upgrade -y"
     - send: "<sudo-password>"
 ```
 
+## commands
 
-## CLI
+> **TIP:** instead of using `commands-wrapper` you can use `cw`
 
-**list your commands:**
+**Interactive configurator (add/edit/remove):**
 ```bash
-commands-wrapper list # or ls
-```
-- output:
-```bash
-# ---------------------- command ----------------------
-# description...
-# -----------------------------------------------------
+commands-wrapper configure
 ```
 
-# tip
+---
 
-commands-wrapper detects all `.yaml` files under `commands-wrapper` directory. You can organize them into sub-folders however you like. (or just use the default `commands.yaml` file)
+**Add a command via stdin:**
+```bash
+commands-wrapper add --yaml <<EOF
+command-name:
+  description: "..."
+  steps:
+    - command: "..."
+    - send: "..."
+    ...
+EOF
+```
 
-## Support
+---
 
-If you liked commands-wrapper, please consider starring the repo, and dropping me a follow for more stuff like this :)  
+**List commands:**
+```bash
+commands-wrapper list # or `ls`
+```
+
+**Remove a command:**
+```bash
+commands-wrapper remove <command-name> # or `rm <command-name>`
+```
+
+**Install / uninstall:**
+```bash
+commands-wrapper --install
+commands-wrapper --uninstall
+```
+
+---
+
+**Help:**
+```bash
+commands-wrapper --help
+```
+
+## support
+
+If you liked commands-wrapper, please consider starring the repo, and dropping a follow for more stuff like this :)  
 It takes less than a minute and will help a lot ❤️  
 
 If you want to show extra love, consider *[buying me a coffee](https://buymeacoffee.com/specter0o0)*! ☕
