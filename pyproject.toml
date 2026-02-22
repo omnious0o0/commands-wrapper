@@ -18,7 +18,8 @@ classifiers = [
 ]
 dependencies = [
     "pyyaml>=6.0",
-    "pexpect>=4.8"
+    "pexpect>=4.8; platform_system != 'Windows'",
+    "windows-curses>=2.4; platform_system == 'Windows'"
 ]
 
 [tool.setuptools]

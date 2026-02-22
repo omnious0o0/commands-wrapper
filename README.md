@@ -1,40 +1,61 @@
 # commands-wrapper
 
-commands-wrapper lets you wrap multi-step shell sequences into a single named command.
+`commands-wrapper` wraps multi-step shell sequences into a single named command.
 
-It's simple to interact with, and very powerful for automating repetitive tasks.
+## OS support
 
-## installation
+- ✅ Linux
+- ✅ macOS
+- ✅ Windows (PowerShell + CMD wrappers)
 
-**One-liner:**
+Generated wrappers:
+- Linux/macOS: `cw`, `command-wrapper`, and command-name shims in `~/.local/bin`
+- Windows: `.cmd` and `.ps1` shims in `%APPDATA%\Python\...\Scripts`
+
+## Installation
+
+### Linux / macOS
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh | bash
 ```
 
-## usage
+### Windows (PowerShell)
 
-### Interactive CLI (Quick & Easy)
+```powershell
+iwr -useb https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.ps1 | iex
+```
+
+### pip (all OS)
+
+```bash
+python -m pip install commands-wrapper
+```
+
+## Usage
+
+### Interactive mode
 
 ```bash
 commands-wrapper configure
 ```
 
-**IMPORTANT:** To use the commands, you have 2 options:
-- <command-name> # make sure it doesn't conflict with any other command.
-- command-wrapper <command-name> # or `cw <command-name>` This ensures there are no conflicts.
+If a full TUI is unavailable in the current shell, the command falls back to non-interactive guidance.
 
 ### YAML format
+
 ```yaml
 command-name:
-  description: "Description of the command" # required
-  steps <NUM>: # <NUM> is timeout in seconds (optional)
-    - command: "command to run" # required
-    - send: "text to send to the command" # optional
-    - press_key: "key to press" # optional
-    - wait: "time to wait" # optional
+  description: "Description of the command"
+  steps <NUM>:
+    - command: "command to run"
+    - send: "text to send to the command"
+    - press_key: "key to press"
+    - wait: "time to wait"
 ```
 
-example:
+Example:
+
 ```yaml
 system --update:
   description: "Quick system update"
@@ -43,62 +64,57 @@ system --update:
     - send: "<sudo-password>"
 ```
 
-## commands
+## Commands
 
-> **TIP:** instead of using `commands-wrapper` you can use `cw`
+> Tip: `cw` is an alias wrapper for `commands-wrapper`
 
-**Interactive configurator (add/edit/remove):**
+### Configure
+
 ```bash
 commands-wrapper configure
 ```
 
----
+### Add from stdin
 
-**Add a command via stdin:**
 ```bash
 commands-wrapper add --yaml <<EOF
 command-name:
   description: "..."
   steps:
     - command: "..."
-    - send: "..."
-    ...
 EOF
 ```
 
----
+### List
 
-**List commands:**
 ```bash
-commands-wrapper list # or `ls`
+commands-wrapper list
 ```
 
-**Remove a command:**
+### Remove
+
 ```bash
-commands-wrapper remove <command-name> # or `rm <command-name>`
+commands-wrapper remove <command-name>
 ```
 
-**Install / uninstall:**
+### Sync wrappers
+
 ```bash
-commands-wrapper --install
+commands-wrapper sync
+commands-wrapper sync --uninstall
+```
+
+### Hook output for shell init
+
+```bash
+commands-wrapper hook
+```
+
+### Uninstall
+
+```bash
 commands-wrapper --uninstall
 ```
-
----
-
-**Help:**
-```bash
-commands-wrapper --help
-```
-
-## support
-
-If you liked commands-wrapper, please consider starring the repo, and dropping a follow for more stuff like this :)  
-It takes less than a minute and will help a lot ❤️  
-
-If you want to show extra love, consider *[buying me a coffee](https://buymeacoffee.com/specter0o0)*! ☕
-
-[![alt text](https://imgs.search.brave.com/FolmlC7tneei1JY_QhD9teOLwsU3rivglA3z2wWgJL8/rs:fit:860:0:0:0/g:ce/aHR0cHM6Ly93aG9w/LmNvbS9ibG9nL2Nv/bnRlbnQvaW1hZ2Vz/L3NpemUvdzIwMDAv/MjAyNC8wNi9XaGF0/LWlzLUJ1eS1NZS1h/LUNvZmZlZS53ZWJw)](https://buymeacoffee.com/specter0o0)
 
 ## License
 

@@ -3,12 +3,21 @@ import os
 import sys
 import time
 import subprocess
-import curses
 import argparse
 import shlex
+import threading
 import yaml
-import pexpect
 from typing import Dict, List, Any, Optional
+
+try:
+    import curses  # type: ignore
+except Exception:  # pragma: no cover - platform dependent
+    curses = None  # type: ignore
+
+try:
+    import pexpect  # type: ignore
+except Exception:  # pragma: no cover - platform dependent
+    pexpect = None  # type: ignore
 
 ANSI_PRIMARY = "\033[38;5;67m"
 ANSI_MUTED = "\033[38;5;244m"
@@ -19,7 +28,31 @@ ANSI_RESET = "\033[0m"
 
 HEADER_TITLE = "commands-wrapper"
 
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WRAPPER_MARKER = "COMMANDS-WRAPPER-GENERATED"
+
+
+def _script_bin_dir(platform_name: Optional[str] = None) -> str:
+    import site
+
+    plat = platform_name or os.name
+    suffix = 'Scripts' if plat == 'nt' else 'bin'
+    return os.path.join(site.USER_BASE, suffix)
+
+
+def _shell_name() -> str:
+    if os.name == 'nt':
+        return os.environ.get('COMSPEC', 'cmd.exe')
+    return os.environ.get('SHELL', '/bin/sh')
+
+
+def _has_tui_support() -> bool:
+    return curses is not None and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _cmd_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _init_colors():
@@ -481,31 +514,48 @@ def load_cmds(files: List[str]) -> Dict[str, Dict[str, Any]]:
     return cmds
 
 
-def sync_binaries(db: Dict[str, Any], uninstall: bool = False):
-    import site
-    import stat
-    bin_dir = os.path.join(site.USER_BASE, 'bin')
-    os.makedirs(bin_dir, exist_ok=True)
 
-    expected = set()
+def sync_binaries(
+    db: Dict[str, Any],
+    uninstall: bool = False,
+    bin_dir: Optional[str] = None,
+    platform_name: Optional[str] = None,
+):
+    import stat
+
+    plat = platform_name or os.name
+    target_dir = bin_dir or _script_bin_dir(plat)
+    os.makedirs(target_dir, exist_ok=True)
+
+    expected_commands = set()
     if not uninstall:
-        expected = {'cw', 'command-wrapper'}
-        for k in db.keys():
-            base = str(k).split()[0] if str(k).strip() else ""
+        expected_commands = {'cw', 'command-wrapper'}
+        for key in db.keys():
+            base = str(key).split()[0] if str(key).strip() else ""
             if base and all(c.isalnum() or c in '-_' for c in base):
-                expected.add(base)
+                expected_commands.add(base)
+
+    if plat == 'nt':
+        expected_files = {
+            f"{name}{suffix}"
+            for name in expected_commands
+            for suffix in ('.cmd', '.ps1')
+        }
+    else:
+        expected_files = set(expected_commands)
 
     try:
-        for f in os.listdir(bin_dir):
-            p = os.path.join(bin_dir, f)
-            if os.path.isfile(p):
-                try:
-                    with open(p, 'r') as fd:
-                        header = fd.read(50)
-                    if "COMMANDS-WRAPPER-GENERATED" in header and f not in expected:
-                        os.remove(p)
-                except Exception:
-                    pass
+        for filename in os.listdir(target_dir):
+            path = os.path.join(target_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
+                    header = fd.read(160)
+                if WRAPPER_MARKER in header and filename not in expected_files:
+                    os.remove(path)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -513,22 +563,49 @@ def sync_binaries(db: Dict[str, Any], uninstall: bool = False):
         return
 
     wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else 'commands-wrapper'
-    wrapper_target_q = shlex.quote(wrapper_target)
 
-    for e in expected:
-        p = os.path.join(bin_dir, e)
-        if e in ('cw', 'command-wrapper'):
-            content = f"#!/usr/bin/env bash\n# COMMANDS-WRAPPER-GENERATED\nexec {wrapper_target_q} \"$@\"\n"
+    for entry in expected_commands:
+        forwarded_args = '"$@"' if entry in ('cw', 'command-wrapper') else f'"{entry}" "$@"'
+
+        if plat == 'nt':
+            cmd_path = os.path.join(target_dir, f"{entry}.cmd")
+            ps1_path = os.path.join(target_dir, f"{entry}.ps1")
+            python_q = _cmd_quote(sys.executable)
+            target_q = _cmd_quote(wrapper_target)
+
+            cmd_forward = '%*' if entry in ('cw', 'command-wrapper') else f'"{entry}" %*'
+            cmd_content = (
+                '@echo off\n'
+                f'REM {WRAPPER_MARKER}\n'
+                f'{python_q} {target_q} {cmd_forward}\n'
+            )
+            ps1_forward = '@args' if entry in ('cw', 'command-wrapper') else f'"{entry}" @args'
+            ps1_content = (
+                f'# {WRAPPER_MARKER}\n'
+                f'& {_cmd_quote(sys.executable)} {_cmd_quote(wrapper_target)} {ps1_forward}\n'
+            )
+
+            for wrapper_path, content in ((cmd_path, cmd_content), (ps1_path, ps1_content)):
+                try:
+                    with open(wrapper_path, 'w', encoding='utf-8', newline='\n') as fd:
+                        fd.write(content)
+                except Exception:
+                    pass
         else:
-            content = f"#!/usr/bin/env bash\n# COMMANDS-WRAPPER-GENERATED\nexec {wrapper_target_q} \"{e}\" \"$@\"\n"
-        try:
-            with open(p, 'w') as fd:
-                fd.write(content)
-            st = os.stat(p)
-            os.chmod(p, st.st_mode | stat.S_IEXEC)
-        except Exception:
-            pass
-
+            script_path = os.path.join(target_dir, entry)
+            wrapper_target_q = shlex.quote(wrapper_target)
+            content = (
+                '#!/usr/bin/env bash\n'
+                f'# {WRAPPER_MARKER}\n'
+                f'exec {wrapper_target_q} {forwarded_args}\n'
+            )
+            try:
+                with open(script_path, 'w', encoding='utf-8', newline='\n') as fd:
+                    fd.write(content)
+                st = os.stat(script_path)
+                os.chmod(script_path, st.st_mode | stat.S_IEXEC)
+            except Exception:
+                pass
 
 def save_cmd(name: str, cfg: Dict[str, Any], file_path: str):
     data = {}
@@ -685,7 +762,23 @@ def _wizard_main(win):
             _wizard_edit(win, db)
 
 
+
+def _run_basic_wizard() -> None:
+    print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
+    print("Terminal UI is unavailable on this platform or shell.")
+    print("Use non-interactive commands instead:")
+    print("  commands-wrapper add --yaml <<EOF")
+    print("  ...")
+    print("  EOF")
+    print("  commands-wrapper list")
+    print("  commands-wrapper remove <name>")
+
+
 def run_wizard():
+    if not _has_tui_support():
+        _run_basic_wizard()
+        return
+
     try:
         curses.wrapper(_wizard_main)
     except KeyboardInterrupt:
@@ -707,36 +800,174 @@ def _run_pip(args: List[str], cwd: Optional[str] = None, suppress_output: bool =
     return fallback.returncode
 
 
-def run_step(proc, ctx: Dict[str, Any], timeout):
-    if 'command' in ctx:
-        if proc and proc.isalive():
-            proc.logfile_read = None
-            try:
-                proc.interact()
-            except Exception:
-                pass
-            proc.close()
-        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{ctx['command']}")
-        proc = pexpect.spawn(
-            os.environ.get('SHELL', 'sh'),
-            ['-c', ctx['command']],
+
+class StepTimeoutError(RuntimeError):
+    """Raised when a command step exceeds its timeout."""
+
+
+class ProcessAdapter:
+    def isalive(self) -> bool:
+        raise NotImplementedError
+
+    def interact(self) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def sendline(self, text: str = "") -> None:
+        raise NotImplementedError
+
+    def send(self, text: str) -> None:
+        raise NotImplementedError
+
+
+class PExpectProcessAdapter(ProcessAdapter):
+    def __init__(self, command: str, timeout: Optional[int]):
+        self._proc = pexpect.spawn(
+            _shell_name(),
+            ['-c', command],
             encoding='utf-8',
             timeout=timeout,
         )
-        proc.logfile_read = sys.stdout
-    elif 'send' in ctx and proc:
+        self._proc.logfile_read = sys.stdout
+
+    def isalive(self) -> bool:
+        return self._proc.isalive()
+
+    def interact(self) -> None:
+        try:
+            self._proc.interact()
+            return
+        except pexpect.TIMEOUT as exc:
+            raise StepTimeoutError from exc
+        except Exception:
+            # Non-interactive shells (CI, pipes) cannot attach a TTY.
+            pass
+
+        try:
+            self._proc.expect(pexpect.EOF, timeout=self._proc.timeout)
+        except pexpect.TIMEOUT as exc:
+            raise StepTimeoutError from exc
+
+    def close(self) -> None:
+        self._proc.close()
+
+    def sendline(self, text: str = "") -> None:
+        self._proc.sendline(text)
+
+    def send(self, text: str) -> None:
+        self._proc.send(text)
+
+
+class SubprocessProcessAdapter(ProcessAdapter):
+    def __init__(self, command: str, timeout: Optional[int]):
+        self._timeout = timeout
+        kwargs: Dict[str, Any] = {
+            'stdin': subprocess.PIPE,
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.STDOUT,
+            'text': True,
+            'encoding': 'utf-8',
+            'errors': 'replace',
+            'bufsize': 1,
+            'shell': True,
+        }
+        if os.name != 'nt':
+            kwargs['executable'] = _shell_name()
+        self._proc = subprocess.Popen(command, **kwargs)
+        self._reader_done = threading.Event()
+        self._reader = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._reader.start()
+
+    def _pump_stdout(self) -> None:
+        try:
+            if not self._proc.stdout:
+                return
+            for line in self._proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+        finally:
+            self._reader_done.set()
+
+    def isalive(self) -> bool:
+        return self._proc.poll() is None
+
+    def interact(self) -> None:
+        try:
+            self._proc.wait(timeout=self._timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise StepTimeoutError from exc
+        finally:
+            self._reader_done.wait(timeout=0.5)
+
+    def close(self) -> None:
+        if self.isalive():
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=2)
+        self._reader_done.wait(timeout=0.5)
+
+        for stream in (self._proc.stdin, self._proc.stdout, self._proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+
+    def sendline(self, text: str = "") -> None:
+        self.send(text + "\n")
+
+    def send(self, text: str) -> None:
+        if not self._proc.stdin:
+            raise ValueError('cannot send input to command without stdin')
+        if not self.isalive():
+            raise ValueError('cannot send input: process already exited')
+        self._proc.stdin.write(text)
+        self._proc.stdin.flush()
+
+
+def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
+    if pexpect is not None and os.name != 'nt':
+        return PExpectProcessAdapter(command, timeout)
+    return SubprocessProcessAdapter(command, timeout)
+
+
+def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optional[int]):
+    if 'command' in ctx:
+        if proc and proc.isalive():
+            try:
+                proc.interact()
+            finally:
+                proc.close()
+
+        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{ctx['command']}")
+        return _spawn_process(str(ctx['command']), timeout)
+
+    if 'send' in ctx:
+        if not proc:
+            raise ValueError("'send' step requires a running command step")
         proc.sendline(str(ctx['send']))
-    elif 'press_key' in ctx and proc:
-        k = str(ctx['press_key']).lower()
-        if k in ('enter', 'return'):
+        return proc
+
+    if 'press_key' in ctx:
+        if not proc:
+            raise ValueError("'press_key' step requires a running command step")
+        key_name = str(ctx['press_key']).lower()
+        if key_name in ('enter', 'return'):
             proc.sendline()
-        elif k == 'tab':
+        elif key_name == 'tab':
             proc.send('\t')
-        elif k in ('esc', 'escape'):
+        elif key_name in ('esc', 'escape'):
             proc.send('\x1b')
         else:
-            proc.send(k)
-    elif 'wait' in ctx:
+            proc.send(str(ctx['press_key']))
+        return proc
+
+    if 'wait' in ctx:
         try:
             duration = float(ctx['wait'])
         except (TypeError, ValueError) as exc:
@@ -744,8 +975,9 @@ def run_step(proc, ctx: Dict[str, Any], timeout):
         if duration < 0:
             raise ValueError(f"wait duration must be non-negative: {ctx['wait']}")
         time.sleep(duration)
-    return proc
+        return proc
 
+    raise ValueError(f"invalid step object: {ctx}")
 
 def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
     key = _get_steps_key(cfg)
@@ -777,19 +1009,18 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
     except ValueError as exc:
         _error(str(exc))
         sys.exit(1)
-    except pexpect.TIMEOUT:
+    except StepTimeoutError:
         _error(f"command '{name}' timed out.")
         sys.exit(1)
-    except pexpect.EOF:
-        return
 
     if proc and proc.isalive():
-        proc.logfile_read = None
         try:
             proc.interact()
-        except Exception:
-            pass
-        proc.close()
+        except StepTimeoutError:
+            _error(f"command '{name}' timed out.")
+            sys.exit(1)
+        finally:
+            proc.close()
 
 
 def print_list(db: Dict):
@@ -917,13 +1148,21 @@ def main():
         print_list(db)
 
     elif action == 'hook':
-        print("alias cw='commands-wrapper'")
-        print("alias command-wrapper='commands-wrapper'")
         db = load_cmds(find_yamls())
-        for k in sorted(db.keys()):
-            base = str(k).split()[0] if str(k).strip() else ""
-            if base and all(c.isalnum() or c in '-_' for c in base):
-                print(f"alias {base}='commands-wrapper {base}'")
+        if os.name == 'nt':
+            print('doskey cw=commands-wrapper $*')
+            print('doskey command-wrapper=commands-wrapper $*')
+            for k in sorted(db.keys()):
+                base = str(k).split()[0] if str(k).strip() else ""
+                if base and all(c.isalnum() or c in '-_' for c in base):
+                    print(f'doskey {base}=commands-wrapper {base} $*')
+        else:
+            print("alias cw='commands-wrapper'")
+            print("alias command-wrapper='commands-wrapper'")
+            for k in sorted(db.keys()):
+                base = str(k).split()[0] if str(k).strip() else ""
+                if base and all(c.isalnum() or c in '-_' for c in base):
+                    print(f"alias {base}='commands-wrapper {base}'")
 
     elif action == 'sync':
         db = load_cmds(find_yamls())
