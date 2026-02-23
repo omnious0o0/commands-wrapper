@@ -17,16 +17,28 @@ Generated wrappers:
 ### Linux / macOS
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh | bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh
+bash install.sh
+rm -f install.sh
 ```
 
-If your environment requires stricter controls, download and review the script before executing it.
+If your environment requires stricter controls, review `install.sh` before running it.
+
+Optional environment variables for the shell installer:
+- `COMMANDS_WRAPPER_SOURCE_URL` to override the source tarball URL.
+- `COMMANDS_WRAPPER_SOURCE_SHA256` to enforce SHA-256 verification of that tarball.
 
 ### Windows (PowerShell)
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.ps1 | iex
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.ps1" -OutFile "install.ps1"
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+Remove-Item .\install.ps1
 ```
+
+Optional environment variable for the PowerShell installer:
+- `COMMANDS_WRAPPER_SOURCE_URL` to override the source URL passed to `pip install`.
+- `COMMANDS_WRAPPER_SOURCE_SHA256` to enforce SHA-256 verification when a remote archive is downloaded first.
 
 ### pip (all OS, from GitHub source)
 
@@ -49,7 +61,7 @@ If a full TUI is unavailable in the current shell, the command falls back to non
 The TUI opens directly into your command list for quick editing:
 - `+ Add new command` is always shown at the top.
 - Press `Enter` on any command row to rename it, edit metadata, edit steps, or delete it.
-- Existing steps support direct content editing (not only move/delete).
+- Existing steps support direct content editing (not just move/delete).
 - `Refresh list` and `Exit` are available in the same screen.
 
 Command definitions are discovered from:
@@ -119,6 +131,9 @@ commands-wrapper list
 
 ```bash
 commands-wrapper remove <command-name>
+
+# multi-word names
+commands-wrapper remove "command name"
 ```
 
 ### Wrapper sync
@@ -142,6 +157,10 @@ Command matching is case-insensitive. Commands that differ only by case (for exa
 commands-wrapper update
 commands-wrapper upd
 ```
+
+Optional environment variables for update:
+- `COMMANDS_WRAPPER_UPDATE_URL` to override the update source URL.
+- `COMMANDS_WRAPPER_UPDATE_SHA256` to enforce SHA-256 verification before install.
 
 ### Hook output for shell init
 

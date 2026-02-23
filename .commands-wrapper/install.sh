@@ -9,9 +9,39 @@ RESET="\033[0m"
 
 printf "${BLUE}Installing commands-wrapper${RESET}\n"
 
+SOURCE_URL="${COMMANDS_WRAPPER_SOURCE_URL:-https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz}"
+SOURCE_SHA256="${COMMANDS_WRAPPER_SOURCE_SHA256:-}"
+
 run_pip() {
     python3 -m pip "$@" --break-system-packages && return 0
     python3 -m pip "$@"
+}
+
+scripts_dir_from_python() {
+    python3 -c "import os, site, sys, sysconfig; in_venv = getattr(sys, 'base_prefix', sys.prefix) != sys.prefix; scripts = None
+if in_venv:
+    scripts = sysconfig.get_path('scripts')
+else:
+    scheme = f'{os.name}_user'
+    if scheme in sysconfig.get_scheme_names():
+        scripts = sysconfig.get_path('scripts', scheme=scheme)
+scripts = scripts or os.path.join(site.USER_BASE or os.path.expanduser('~'), 'bin')
+print(os.path.abspath(scripts))"
+}
+
+file_sha256() {
+    python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open('rb') as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
 }
 
 # Dependencies
@@ -47,16 +77,31 @@ if [ ! -f "pyproject.toml" ]; then
 
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TMP_DIR"' EXIT
-    curl -sSL https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz \
-        | tar xz --strip-components=1 -C "$TMP_DIR"
+    ARCHIVE_PATH="$TMP_DIR/commands-wrapper.tar.gz"
+    curl -fsSL "$SOURCE_URL" -o "$ARCHIVE_PATH"
+
+    if [ -n "$SOURCE_SHA256" ]; then
+        EXPECTED_SHA256=$(printf "%s" "$SOURCE_SHA256" | tr '[:upper:]' '[:lower:]')
+        if ! printf "%s" "$EXPECTED_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo -e "${RED}invalid COMMANDS_WRAPPER_SOURCE_SHA256 value.${RESET}"
+            exit 1
+        fi
+
+        ACTUAL_SHA256=$(file_sha256 "$ARCHIVE_PATH")
+        if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo -e "${RED}source archive checksum mismatch.${RESET}"
+            exit 1
+        fi
+    fi
+
+    tar xzf "$ARCHIVE_PATH" --strip-components=1 -C "$TMP_DIR"
     cd "$TMP_DIR"
 fi
 echo -e "${GREEN}OK${RESET}"
 
 # Install
 echo -n -e "${GRAY}[3/4] Installing package... ${RESET}"
-run_pip uninstall commands-wrapper -y &>/dev/null || true
-run_pip install . -q
+run_pip install --upgrade . -q
 echo -e "${GREEN}OK${RESET}"
 
 # Configure
@@ -74,15 +119,18 @@ if [ ! -f "$INSTALL_CWD/commands.yaml" ] && [ ! -f "$INSTALL_CWD/commands.yml" ]
 EOF
 fi
 
-BIN_PATH=$(python3 -c "import site, os; print(os.path.join(site.USER_BASE, 'bin', 'commands-wrapper'))")
+BIN_DIR=$(scripts_dir_from_python)
+BIN_PATH="$BIN_DIR/commands-wrapper"
 if [ -f "$BIN_PATH" ]; then
     chmod +x "$BIN_PATH"
-    "$BIN_PATH" sync &>/dev/null || true
+    if ! "$BIN_PATH" sync &>/dev/null; then
+        echo -e "${RED}wrapper sync failed.${RESET}"
+        exit 1
+    fi
 fi
 echo -e "${GREEN}OK${RESET}"
 
 # PATH check
-BIN_DIR=$(python3 -c "import site, os; print(os.path.join(site.USER_BASE, 'bin'))")
 if ! python3 - "$BIN_DIR" <<'PY'
 import os
 import sys

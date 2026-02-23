@@ -3,10 +3,14 @@ import os
 import shutil
 import sys
 import time
+import hashlib
+import tempfile
 import subprocess
 import argparse
 import shlex
 import threading
+import urllib.error
+import urllib.request
 import yaml
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -39,7 +43,8 @@ PRIMARY_WRAPPER = "commands-wrapper"
 SHORT_ALIAS = "cw"
 LEGACY_ALIAS = "command-wrapper"
 
-UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
+DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
+UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,8 +53,22 @@ WRAPPER_MARKER = "COMMANDS-WRAPPER-GENERATED"
 
 def _script_bin_dir(platform_name: Optional[str] = None) -> str:
     import site
+    import sysconfig
 
     plat = platform_name or os.name
+    if plat == os.name:
+        in_venv = getattr(sys, 'base_prefix', sys.prefix) != sys.prefix
+        scripts_dir: Optional[str] = None
+        if in_venv:
+            scripts_dir = sysconfig.get_path('scripts')
+        else:
+            user_scheme = f'{plat}_user'
+            if user_scheme in sysconfig.get_scheme_names():
+                scripts_dir = sysconfig.get_path('scripts', scheme=user_scheme)
+
+        if scripts_dir:
+            return os.path.abspath(scripts_dir)
+
     suffix = 'Scripts' if plat == 'nt' else 'bin'
     user_base = site.USER_BASE or os.path.expanduser('~')
     return os.path.join(user_base, suffix)
@@ -184,6 +203,42 @@ def _draw_header(win, title: str, compact: bool = False):
     return y + 3
 
 
+def _read_esc_followup_key(win, wait_seconds: float = 0.04) -> int:
+    deadline = time.monotonic() + wait_seconds
+    win.nodelay(True)
+    try:
+        while time.monotonic() < deadline:
+            key = win.getch()
+            if key != -1:
+                return key
+            time.sleep(0.005)
+    finally:
+        win.nodelay(False)
+    return -1
+
+
+def _handle_escape_in_form(win, fields: List['Field'], focus: int) -> bool:
+    nk = _read_esc_followup_key(win)
+    if nk == -1:
+        return False
+
+    if nk in (10, 13):  # Alt+Enter: insert newline in multiline fields
+        f = fields[focus]
+        if f.multiline:
+            p, n = f.lines[f.cur_y][:f.cur_x], f.lines[f.cur_y][f.cur_x:]
+            f.lines[f.cur_y] = p
+            f.lines.insert(f.cur_y + 1, n)
+            f.cur_y += 1
+            f.cur_x = 0
+        return True
+
+    try:
+        curses.ungetch(nk)
+    except curses.error:
+        pass
+    return True
+
+
 def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]:
     """Arrow-key navigable menu. Returns selected index or None if cancelled."""
     if not options:
@@ -232,9 +287,9 @@ def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]
         win.refresh()
         key = win.getch()
 
-        if key in (curses.KEY_UP, ord('k')):
+        if key in (curses.KEY_UP, ord('k'), ord('K')):
             cur = (cur - 1) % len(options)
-        elif key in (curses.KEY_DOWN, ord('j')):
+        elif key in (curses.KEY_DOWN, ord('j'), ord('J')):
             cur = (cur + 1) % len(options)
         elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
             return cur
@@ -374,19 +429,9 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
             if key == 19:  # Ctrl+S
                 return {f.key: f.get_value() for f in fields}
             elif key == 27:  # ESC or Alt+key
-                win.nodelay(True)
-                nk = win.getch()
-                win.nodelay(False)
-                if nk == -1:
+                if not _handle_escape_in_form(win, fields, focus):
                     return None
-                if nk in (10, 13):  # Alt+Enter: insert newline in multiline fields
-                    f = fields[focus]
-                    if f.multiline:
-                        p, n = f.lines[f.cur_y][:f.cur_x], f.lines[f.cur_y][f.cur_x:]
-                        f.lines[f.cur_y] = p
-                        f.lines.insert(f.cur_y + 1, n)
-                        f.cur_y += 1
-                        f.cur_x = 0
+                continue
             elif key == 9:  # Tab
                 focus = (focus + 1) % len(fields)
             elif key == curses.KEY_BTAB:
@@ -688,15 +733,19 @@ def _report_sync_messages(messages: List[str], emit: bool = True) -> bool:
     return has_errors
 
 
-def load_cmds(files: List[str]) -> Dict[str, Dict[str, Any]]:
+def load_cmds(files: List[str], warnings: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
     cmds = {}
     for f in files:
         try:
             with open(f, encoding='utf-8') as stream:
                 data = yaml.safe_load(stream)
-        except OSError:
+        except OSError as exc:
+            if warnings is not None:
+                warnings.append(f"failed to read command file '{f}': {exc}")
             continue
-        except yaml.YAMLError:
+        except yaml.YAMLError as exc:
+            if warnings is not None:
+                warnings.append(f"failed to parse command file '{f}': {exc}")
             continue
 
         if not isinstance(data, dict):
@@ -763,19 +812,20 @@ def _build_command_lookup_index(db: Dict[str, Any]) -> Tuple[Dict[str, str], Lis
     errors: List[str] = []
 
     for raw_name in db.keys():
-        command_name = str(raw_name).strip()
+        raw_command_name = str(raw_name)
+        command_name = raw_command_name.strip()
         if not command_name:
             continue
 
         lookup_key = _command_lookup_key(command_name)
         previous = index.get(lookup_key)
-        if previous and previous != command_name:
+        if previous and previous != raw_command_name:
             errors.append(
-                f"case-insensitive command name collision: '{previous}' vs '{command_name}'"
+                f"case-insensitive command name collision: {previous!r} vs {raw_command_name!r}"
             )
             continue
 
-        index[lookup_key] = command_name
+        index[lookup_key] = raw_command_name
 
     return index, errors
 
@@ -839,7 +889,6 @@ def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
 def _build_wrapper_map_with_conflicts(
     db: Dict[str, Any],
     target_dir: str,
-    platform_name: str,
     report_conflicts: bool = True,
 ) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     wrappers, errors = _build_wrapper_map(db)
@@ -886,7 +935,6 @@ def sync_binaries(
         custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(
             db,
             target_dir,
-            plat,
             report_conflicts=report_conflicts,
         )
         errors.extend(wrapper_errors)
@@ -933,7 +981,9 @@ def sync_binaries(
     if uninstall:
         return errors
 
-    wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else PRIMARY_WRAPPER
+    wrapper_target = os.path.realpath(__file__)
+    if not os.path.isfile(wrapper_target):
+        wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else PRIMARY_WRAPPER
     python_q = _cmd_quote(sys.executable)
     target_q = _cmd_quote(wrapper_target)
     wrapper_target_q = shlex.quote(wrapper_target)
@@ -973,7 +1023,7 @@ def sync_binaries(
         else:
             script_path = os.path.join(target_dir, entry)
             content = (
-                '#!/usr/bin/env bash\n'
+                '#!/usr/bin/env sh\n'
                 f'# {WRAPPER_MARKER}\n'
                 f'{unix_exec_line}'
             )
@@ -996,8 +1046,10 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
                 loaded = yaml.safe_load(f)
                 if isinstance(loaded, dict):
                     data = loaded
-        except (OSError, yaml.YAMLError):
-            pass
+        except OSError as exc:
+            return [f"failed to read command file '{file_path}': {exc}"]
+        except yaml.YAMLError as exc:
+            return [f"failed to parse command file '{file_path}': {exc}"]
 
     all_commands = load_cmds(find_yamls())
     lookup_index, lookup_errors = _build_command_lookup_index(all_commands)
@@ -1021,22 +1073,25 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
     return sync_binaries(load_cmds(find_yamls()))
 
 
-def remove_from_file(name: str, file_path: str) -> Tuple[bool, List[str]]:
+def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
     if not os.path.exists(file_path):
-        return False, []
+        return False, f"source file not found: {file_path}", []
     try:
         with open(file_path, encoding='utf-8') as f:
             loaded = yaml.safe_load(f)
             data = loaded if isinstance(loaded, dict) else {}
-        if name in data:
-            del data[name]
-            with open(file_path, 'w', encoding='utf-8') as f:
-                yaml.safe_dump(data, f, sort_keys=False)
-            sync_errors = sync_binaries(load_cmds(find_yamls()))
-            return True, sync_errors
-    except (OSError, yaml.YAMLError):
-        pass
-    return False, []
+
+        if name not in data:
+            return False, f"'{name}' not found in source file", []
+
+        del data[name]
+        with open(file_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+
+        sync_errors = sync_binaries(load_cmds(find_yamls()))
+        return True, "", sync_errors
+    except (OSError, yaml.YAMLError) as exc:
+        return False, f"failed to update source file: {exc}", []
 
 
 def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, str, List[str]]:
@@ -1266,9 +1321,9 @@ def _wizard_edit_command(win, name: str) -> str:
         elif action == 3:
             confirm = menu(win, f"Delete '{current_name}'?", ["Cancel", "Delete"])
             if confirm == 1:
-                removed, sync_messages = remove_from_file(current_name, cfg['_source'])
+                removed, err_message, sync_messages = remove_from_file(current_name, cfg['_source'])
                 if not removed:
-                    status = "ERR: Failed to remove command."
+                    status = f"ERR: {err_message}"
                     continue
 
                 if _report_sync_messages(sync_messages, emit=False):
@@ -1369,7 +1424,7 @@ def _strip_add_yaml_flag(argv: List[str]) -> Tuple[List[str], bool]:
     filtered = [argv[0]]
     has_yaml_flag = False
     for part in argv[1:]:
-        if part == '--yaml':
+        if isinstance(part, str) and part.casefold() == '--yaml':
             has_yaml_flag = True
             continue
         filtered.append(part)
@@ -1529,7 +1584,7 @@ class PExpectProcessAdapter(ProcessAdapter):
             return
         except pexpect.TIMEOUT as exc:
             raise StepTimeoutError from exc
-        except Exception:
+        except (pexpect.EOF, OSError, ValueError):
             # Non-interactive shells (CI, pipes) cannot attach a TTY.
             pass
 
@@ -1614,7 +1669,7 @@ class SubprocessProcessAdapter(ProcessAdapter):
             try:
                 if stream:
                     stream.close()
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
     def sendline(self, text: str = "") -> None:
@@ -1684,7 +1739,8 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
     if 'press_key' in ctx:
         if not proc:
             raise ValueError("'press_key' step requires a running command step")
-        key_name = str(ctx['press_key']).lower()
+        raw_key = str(ctx['press_key'])
+        key_name = raw_key.strip().casefold()
         if key_name in ('enter', 'return'):
             proc.sendline()
         elif key_name == 'tab':
@@ -1692,7 +1748,7 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
         elif key_name in ('esc', 'escape'):
             proc.send('\x1b')
         else:
-            proc.send(str(ctx['press_key']))
+            proc.send(raw_key)
         return proc
 
     if 'wait' in ctx:
@@ -1884,17 +1940,107 @@ def _find_package_source() -> Optional[str]:
     return None
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as fd:
+        for chunk in iter(lambda: fd.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _prepare_update_source() -> Tuple[str, Optional[str]]:
+    expected_sha256 = os.environ.get('COMMANDS_WRAPPER_UPDATE_SHA256', '').strip().lower()
+    if not expected_sha256:
+        return UPDATE_TARBALL_URL, None
+
+    if len(expected_sha256) != 64 or any(c not in '0123456789abcdef' for c in expected_sha256):
+        raise ValueError('invalid COMMANDS_WRAPPER_UPDATE_SHA256 value')
+
+    fd, archive_path = tempfile.mkstemp(prefix='commands-wrapper-update-', suffix='.tar.gz')
+    os.close(fd)
+
+    try:
+        with urllib.request.urlopen(UPDATE_TARBALL_URL) as response, open(archive_path, 'wb') as out:
+            shutil.copyfileobj(response, out)
+    except (OSError, urllib.error.URLError) as exc:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise ValueError(f'failed to download update archive: {exc}') from exc
+
+    actual_sha256 = _sha256_file(archive_path)
+    if actual_sha256 != expected_sha256:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise ValueError('update archive checksum mismatch')
+
+    return archive_path, archive_path
+
+
+def _find_source_cli_for_build_artifact(script_path: Optional[str] = None) -> Optional[str]:
+    current = os.path.realpath(script_path or __file__)
+    normalized = current.replace('\\', '/')
+    if '/build/scripts-' not in normalized:
+        return None
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(current)))
+    source_cli = os.path.join(repo_root, '.commands-wrapper', PRIMARY_WRAPPER)
+    if not os.path.isfile(source_cli):
+        return None
+
+    source_real = os.path.realpath(source_cli)
+    if source_real == current:
+        return None
+
+    return source_real
+
+
+def _reexec_if_stale_build_script() -> None:
+    source_cli = _find_source_cli_for_build_artifact()
+    if not source_cli:
+        return
+
+    _warn(
+        "detected execution from a build artifact; re-running with project source script "
+        f"'{source_cli}'."
+    )
+    os.execv(sys.executable, [sys.executable, source_cli, *sys.argv[1:]])
+
+
 def _auto_update():
     print(f"{ANSI_MUTED}Updating from GitHub...{ANSI_RESET}")
-    return_code = _run_pip(['install', '--upgrade', '--force-reinstall', UPDATE_TARBALL_URL], suppress_output=True)
-    if return_code == 0:
-        sync_errors = sync_binaries(load_cmds(find_yamls()))
-        if _report_sync_messages(sync_errors):
-            return_code = 1
+    try:
+        update_source, cleanup_path = _prepare_update_source()
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+    return_code = 1
+    try:
+        update_args = ['install', '--upgrade', '--force-reinstall', update_source]
+        return_code = _run_pip(update_args, suppress_output=True)
+        if return_code != 0:
+            _warn("Initial update attempt failed; retrying with diagnostics.")
+            return_code = _run_pip(update_args)
+
+        if return_code == 0:
+            sync_errors = sync_binaries(load_cmds(find_yamls()))
+            if _report_sync_messages(sync_errors):
+                return_code = 1
+            else:
+                _ok("Update complete.")
         else:
-            _ok("Update complete.")
-    else:
-        _error("update failed")
+            _error(f"update failed with exit code {return_code}")
+    finally:
+        if cleanup_path:
+            try:
+                os.remove(cleanup_path)
+            except OSError:
+                pass
+
     sys.exit(return_code)
 
 
@@ -1906,7 +2052,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main():
-    sys.argv, has_yaml_flag = _strip_add_yaml_flag(sys.argv)
+    _reexec_if_stale_build_script()
 
     if sys.argv[1:] == ["--install"]:
         _pip_install()
@@ -1928,7 +2074,10 @@ def main():
     normalized_action = action.casefold()
     full_action = " ".join(action_parts)
 
-    db = load_cmds(find_yamls())
+    load_warnings: List[str] = []
+    db = load_cmds(find_yamls(), warnings=load_warnings)
+    for warning in load_warnings:
+        _warn(warning)
     lookup_index, lookup_errors = _build_command_lookup_index(db)
     if lookup_errors:
         for message in lookup_errors:
@@ -1954,7 +2103,7 @@ def main():
 
     elif normalized_action == 'hook':
         target_dir = _script_bin_dir(os.name)
-        wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, os.name)
+        wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir)
         _report_sync_messages(wrapper_errors)
         if os.name == 'nt':
             print(f'doskey {SHORT_ALIAS}={PRIMARY_WRAPPER} $*')
@@ -1982,6 +2131,7 @@ def main():
         run_wizard()
 
     elif normalized_action == 'add':
+        _filtered_argv, has_yaml_flag = _strip_add_yaml_flag([PRIMARY_WRAPPER, *action_parts])
         if not has_yaml_flag:
             _error(f"Usage: {PRIMARY_WRAPPER} add --yaml <<EOF\\n...\\nEOF")
             sys.exit(1)
@@ -1996,18 +2146,22 @@ def main():
             _error(f"Usage: {PRIMARY_WRAPPER} {action} <name>")
             sys.exit(1)
 
-        name = action_parts[1]
+        name = " ".join(action_parts[1:])
         resolved_name = _resolve_command_name(name, db, lookup_index)
         if not resolved_name:
             _error(f"'{name}' not found")
             sys.exit(1)
 
-        removed, sync_messages = remove_from_file(resolved_name, db[resolved_name]['_source'])
+        removed, err_message, sync_messages = remove_from_file(resolved_name, db[resolved_name]['_source'])
+        if not removed:
+            _error(err_message)
+            sys.exit(1)
+
         has_sync_errors = _report_sync_messages(sync_messages)
         if has_sync_errors:
             sys.exit(1)
-        if removed:
-            _ok(f"Removed '{resolved_name}'.")
+
+        _ok(f"Removed '{resolved_name}'.")
 
     else:
         target = _resolve_command_name(full_action, db, lookup_index)

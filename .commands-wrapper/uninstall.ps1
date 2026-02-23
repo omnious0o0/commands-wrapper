@@ -35,13 +35,85 @@ function Invoke-Python {
     throw "Python 3 was not found in PATH."
 }
 
+function Get-PythonScriptsDir {
+    $code = @'
+import os
+import site
+import sys
+import sysconfig
+
+in_venv = getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+scripts = None
+if in_venv:
+    scripts = sysconfig.get_path("scripts")
+else:
+    scheme = f"{os.name}_user"
+    if scheme in sysconfig.get_scheme_names():
+        scripts = sysconfig.get_path("scripts", scheme=scheme)
+
+if not scripts:
+    scripts = os.path.join(site.USER_BASE or os.path.expanduser("~"), "bin")
+
+print(os.path.abspath(scripts))
+'@
+
+    $candidates = @(
+        @{ exe = "py"; args = @("-3") },
+        @{ exe = "python"; args = @() }
+    )
+
+    foreach ($candidate in $candidates) {
+        if (-not (Get-Command $candidate.exe -ErrorAction SilentlyContinue)) {
+            continue
+        }
+
+        $output = & $candidate.exe @($candidate.args + @("-c", $code)) 2>$null
+        if ($LASTEXITCODE -eq 0 -and $output) {
+            return ($output | Select-Object -Last 1).ToString().Trim()
+        }
+    }
+
+    return $null
+}
+
+function Resolve-WrapperSyncCommand {
+    param([string]$ScriptsDir)
+
+    if (-not $ScriptsDir) {
+        return $null
+    }
+
+    $candidates = @(
+        "commands-wrapper.exe",
+        "commands-wrapper",
+        "commands-wrapper.cmd",
+        "commands-wrapper.ps1"
+    )
+
+    foreach ($candidate in $candidates) {
+        $path = Join-Path $ScriptsDir $candidate
+        if (Test-Path $path) {
+            return $path
+        }
+    }
+
+    return $null
+}
+
 $syncWarning = "Wrapper cleanup failed; continuing package uninstall."
-try {
-    commands-wrapper sync --uninstall | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+$scriptsDir = Get-PythonScriptsDir
+$syncCommand = Resolve-WrapperSyncCommand -ScriptsDir $scriptsDir
+
+if ($syncCommand) {
+    try {
+        & $syncCommand sync --uninstall | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host $syncWarning -ForegroundColor Yellow
+        }
+    } catch {
         Write-Host $syncWarning -ForegroundColor Yellow
     }
-} catch {
+} else {
     Write-Host $syncWarning -ForegroundColor Yellow
 }
 
