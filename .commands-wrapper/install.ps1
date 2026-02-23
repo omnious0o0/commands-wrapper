@@ -2,23 +2,57 @@ $ErrorActionPreference = "Stop"
 
 function Invoke-Python {
     param([string[]]$Args)
+
+    $pyExitCode = $null
+    $pythonExitCode = $null
+
     if (Get-Command py -ErrorAction SilentlyContinue) {
         & py -3 @Args
-        return
+        $pyExitCode = $LASTEXITCODE
+        if ($pyExitCode -eq 0) {
+            return
+        }
     }
+
     if (Get-Command python -ErrorAction SilentlyContinue) {
         & python @Args
-        return
+        $pythonExitCode = $LASTEXITCODE
+        if ($pythonExitCode -eq 0) {
+            return
+        }
     }
+
+    if ($pyExitCode -ne $null -and $pythonExitCode -ne $null) {
+        throw "Both 'py -3' (exit $pyExitCode) and 'python' (exit $pythonExitCode) failed."
+    }
+    if ($pyExitCode -ne $null) {
+        throw "'py -3' failed with exit code $pyExitCode."
+    }
+    if ($pythonExitCode -ne $null) {
+        throw "'python' failed with exit code $pythonExitCode."
+    }
+
     throw "Python 3 was not found in PATH."
 }
 
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = Split-Path -Parent $here
-$localProject = Join-Path $repoRoot "pyproject.toml"
+$repoRoot = $null
+if ($MyInvocation.MyCommand.Path) {
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if ($scriptDir) {
+        $repoRoot = Split-Path -Parent $scriptDir
+    }
+}
 
-if (Test-Path $localProject) {
+$cwdRoot = (Get-Location).Path
+$localProject = $null
+if ($repoRoot) {
+    $localProject = Join-Path $repoRoot "pyproject.toml"
+}
+
+if ($localProject -and (Test-Path $localProject)) {
     Invoke-Python @("-m", "pip", "install", $repoRoot)
+} elseif (Test-Path (Join-Path $cwdRoot "pyproject.toml")) {
+    Invoke-Python @("-m", "pip", "install", $cwdRoot)
 } else {
     Invoke-Python @("-m", "pip", "install", "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz")
 }
@@ -36,10 +70,14 @@ if (-not $hasYaml) {
 '@ | Out-File -Encoding utf8 "commands.yaml"
 }
 
+$syncWarning = "Installed, but wrapper sync needs a new shell session."
 try {
     commands-wrapper sync | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host $syncWarning -ForegroundColor Yellow
+    }
 } catch {
-    Write-Host "Installed, but wrapper sync needs a new shell session." -ForegroundColor Yellow
+    Write-Host $syncWarning -ForegroundColor Yellow
 }
 
 Write-Host "commands-wrapper installed." -ForegroundColor Green

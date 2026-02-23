@@ -35,6 +35,11 @@ ANSI_BOLD = "\033[1m"
 ANSI_RESET = "\033[0m"
 
 HEADER_TITLE = "commands-wrapper"
+PRIMARY_WRAPPER = "commands-wrapper"
+SHORT_ALIAS = "cw"
+LEGACY_ALIAS = "command-wrapper"
+
+UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -743,10 +748,18 @@ def _wrapper_name_from_command_name(command_name: str) -> Optional[str]:
     if not all(c.isalnum() or c in '-_' for c in wrapper_name):
         return None
 
-    if wrapper_name in ('cw', 'command-wrapper'):
+    if wrapper_name in (SHORT_ALIAS, LEGACY_ALIAS):
         return None
 
     return wrapper_name
+
+
+def _format_conflict_warning(wrapper_name: str, command_name: str) -> str:
+    return (
+        f"WARN: skipped naked wrapper '{wrapper_name}' for command '{command_name}' "
+        "because that name is already used by another executable on PATH. "
+        f"Use '{SHORT_ALIAS} {command_name}' or '{PRIMARY_WRAPPER} {command_name}' instead."
+    )
 
 
 def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
@@ -775,6 +788,7 @@ def _build_wrapper_map_with_conflicts(
     db: Dict[str, Any],
     target_dir: str,
     platform_name: str,
+    report_conflicts: bool = True,
 ) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     wrappers, errors = _build_wrapper_map(db)
     filtered: Dict[str, str] = {}
@@ -783,16 +797,12 @@ def _build_wrapper_map_with_conflicts(
     search_path = os.environ.get('PATH')
 
     for wrapper_name, command_name in wrappers.items():
-        if platform_name == 'nt':
-            resolved = shutil.which(wrapper_name, path=search_path)
-        else:
-            resolved = shutil.which(wrapper_name, path=search_path)
+        resolved = shutil.which(wrapper_name, path=search_path)
 
         if resolved and not _is_own_wrapper_path(resolved, target_dir):
             blocked[wrapper_name] = command_name
-            errors.append(
-                f"WARN: blocked naked wrapper '{wrapper_name}' for command '{command_name}' because it conflicts with existing command at '{resolved}'. Use 'cw {command_name}' or 'commands-wrapper {command_name}' instead."
-            )
+            if report_conflicts:
+                errors.append(_format_conflict_warning(wrapper_name, command_name))
             continue
 
         filtered[wrapper_name] = command_name
@@ -806,6 +816,7 @@ def sync_binaries(
     uninstall: bool = False,
     bin_dir: Optional[str] = None,
     platform_name: Optional[str] = None,
+    report_conflicts: bool = True,
 )-> List[str]:
     import stat
 
@@ -820,14 +831,19 @@ def sync_binaries(
 
     custom_wrappers: Dict[str, str] = {}
     if not uninstall:
-        custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, plat)
+        custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(
+            db,
+            target_dir,
+            plat,
+            report_conflicts=report_conflicts,
+        )
         errors.extend(wrapper_errors)
 
     wrapper_targets: Dict[str, Optional[str]] = {}
     if not uninstall:
         wrapper_targets = {
-            'cw': None,
-            'command-wrapper': None,
+            SHORT_ALIAS: None,
+            LEGACY_ALIAS: None,
         }
         wrapper_targets.update(custom_wrappers)
 
@@ -865,7 +881,7 @@ def sync_binaries(
     if uninstall:
         return errors
 
-    wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else 'commands-wrapper'
+    wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else PRIMARY_WRAPPER
     python_q = _cmd_quote(sys.executable)
     target_q = _cmd_quote(wrapper_target)
     wrapper_target_q = shlex.quote(wrapper_target)
@@ -1241,11 +1257,25 @@ def _run_basic_wizard() -> None:
     print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
     print("Terminal UI is unavailable on this platform or shell.")
     print("Use non-interactive commands instead:")
-    print("  commands-wrapper add --yaml <<EOF")
+    print(f"  {PRIMARY_WRAPPER} add --yaml <<EOF")
     print("  ...")
     print("  EOF")
-    print("  commands-wrapper list")
-    print("  commands-wrapper remove <name>")
+    print(f"  {PRIMARY_WRAPPER} list")
+    print(f"  {PRIMARY_WRAPPER} remove <name>")
+
+
+def _strip_add_yaml_flag(argv: List[str]) -> Tuple[List[str], bool]:
+    if len(argv) < 2 or argv[1] != 'add':
+        return list(argv), False
+
+    filtered = [argv[0]]
+    has_yaml_flag = False
+    for part in argv[1:]:
+        if part == '--yaml':
+            has_yaml_flag = True
+            continue
+        filtered.append(part)
+    return filtered, has_yaml_flag
 
 
 def run_wizard():
@@ -1700,9 +1730,9 @@ def _pip_install():
 def _pip_uninstall():
     sync_errors = sync_binaries({}, uninstall=True)
     _report_sync_messages(sync_errors)
-    return_code = _run_pip(['uninstall', 'commands-wrapper', '-y'])
+    return_code = _run_pip(['uninstall', PRIMARY_WRAPPER, '-y'])
     if return_code == 0:
-        _ok("Uninstalled commands-wrapper.")
+        _ok(f"Uninstalled {PRIMARY_WRAPPER}.")
     sys.exit(return_code)
 
 
@@ -1720,8 +1750,7 @@ def _find_package_source() -> Optional[str]:
 
 def _auto_update():
     print(f"{ANSI_MUTED}Updating from GitHub...{ANSI_RESET}")
-    url = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
-    return_code = _run_pip(['install', '--upgrade', '--force-reinstall', url], suppress_output=True)
+    return_code = _run_pip(['install', '--upgrade', '--force-reinstall', UPDATE_TARBALL_URL], suppress_output=True)
     if return_code == 0:
         sync_errors = sync_binaries(load_cmds(find_yamls()))
         if _report_sync_messages(sync_errors):
@@ -1741,9 +1770,7 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main():
-    has_yaml_flag = "--yaml" in sys.argv
-    if has_yaml_flag:
-        sys.argv.remove("--yaml")
+    sys.argv, has_yaml_flag = _strip_add_yaml_flag(sys.argv)
 
     if sys.argv[1:] == ["--install"]:
         _pip_install()
@@ -1766,7 +1793,7 @@ def main():
 
     db = load_cmds(find_yamls())
     if action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
-        _report_sync_messages(sync_binaries(db))
+        _report_sync_messages(sync_binaries(db, report_conflicts=False))
 
     if full_action in db:
         exec_cmd(full_action, db[full_action])
@@ -1786,16 +1813,16 @@ def main():
         wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, os.name)
         _report_sync_messages(wrapper_errors)
         if os.name == 'nt':
-            print('doskey cw=commands-wrapper $*')
-            print('doskey command-wrapper=commands-wrapper $*')
+            print(f'doskey {SHORT_ALIAS}={PRIMARY_WRAPPER} $*')
+            print(f'doskey {LEGACY_ALIAS}={PRIMARY_WRAPPER} $*')
             for wrapper_name, command_name in sorted(wrappers.items()):
-                print(f'doskey {wrapper_name}=commands-wrapper {_cmd_quote(command_name)} $*')
+                print(f'doskey {wrapper_name}={PRIMARY_WRAPPER} {_cmd_quote(command_name)} $*')
         else:
-            print("alias cw='commands-wrapper'")
-            print("alias command-wrapper='commands-wrapper'")
+            print(f"alias {SHORT_ALIAS}='{PRIMARY_WRAPPER}'")
+            print(f"alias {LEGACY_ALIAS}='{PRIMARY_WRAPPER}'")
             for wrapper_name, command_name in sorted(wrappers.items()):
                 quoted_command = shlex.quote(command_name)
-                print(f"alias {wrapper_name}=\"commands-wrapper {quoted_command}\"")
+                print(f"alias {wrapper_name}=\"{PRIMARY_WRAPPER} {quoted_command}\"")
 
     elif action == 'sync':
         is_uninstall = "--uninstall" in sys.argv
@@ -1812,7 +1839,7 @@ def main():
 
     elif action == 'add':
         if not has_yaml_flag:
-            _error("Usage: commands-wrapper add --yaml <<EOF\\n...\\nEOF")
+            _error(f"Usage: {PRIMARY_WRAPPER} add --yaml <<EOF\\n...\\nEOF")
             sys.exit(1)
         yaml_content = sys.stdin.read()
         if not yaml_content.strip():
@@ -1822,14 +1849,16 @@ def main():
 
     elif action in ('rm', 'remove'):
         if len(action_parts) < 2:
-            _error(f"Usage: commands-wrapper {action} <name>")
+            _error(f"Usage: {PRIMARY_WRAPPER} {action} <name>")
             sys.exit(1)
         name = action_parts[1]
         if name not in db:
             _error(f"'{name}' not found")
             sys.exit(1)
         removed, sync_messages = remove_from_file(name, db[name]['_source'])
-        _report_sync_messages(sync_messages)
+        has_sync_errors = _report_sync_messages(sync_messages)
+        if has_sync_errors:
+            sys.exit(1)
         if removed:
             _ok(f"Removed '{name}'.")
 

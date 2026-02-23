@@ -24,14 +24,6 @@ if ! python3 -m pip --version &>/dev/null; then
     echo -e "${RED}pip not found.${RESET}"
     exit 1
 fi
-if ! command -v curl &>/dev/null; then
-    echo -e "${RED}curl not found.${RESET}"
-    exit 1
-fi
-if ! command -v tar &>/dev/null; then
-    echo -e "${RED}tar not found.${RESET}"
-    exit 1
-fi
 echo -e "${GREEN}OK${RESET}"
 
 INSTALL_CWD=$(pwd)
@@ -40,6 +32,19 @@ INSTALL_CWD=$(pwd)
 echo -n -e "${GRAY}[2/4] Preparing source... ${RESET}"
 TMP_DIR=""
 if [ ! -f "pyproject.toml" ]; then
+    if ! command -v curl &>/dev/null; then
+        echo -e "${RED}curl not found (required for remote install).${RESET}"
+        exit 1
+    fi
+    if ! command -v tar &>/dev/null; then
+        echo -e "${RED}tar not found (required for remote install).${RESET}"
+        exit 1
+    fi
+    if ! command -v mktemp &>/dev/null; then
+        echo -e "${RED}mktemp not found (required for remote install).${RESET}"
+        exit 1
+    fi
+
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TMP_DIR"' EXIT
     curl -sSL https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz \
@@ -78,7 +83,20 @@ echo -e "${GREEN}OK${RESET}"
 
 # PATH check
 BIN_DIR=$(python3 -c "import site, os; print(os.path.join(site.USER_BASE, 'bin'))")
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+if ! python3 - "$BIN_DIR" <<'PY'
+import os
+import sys
+
+target = os.path.realpath(os.path.expanduser(sys.argv[1]))
+path_entries = [
+    os.path.realpath(os.path.expanduser(entry))
+    for entry in os.environ.get("PATH", "").split(os.pathsep)
+    if entry
+]
+
+sys.exit(0 if target in set(path_entries) else 1)
+PY
+then
     echo
     echo -e "${RED}$BIN_DIR is not in PATH.${RESET}"
     echo -e "${GRAY}Add this to your shell config and restart your shell:${RESET}"
