@@ -34,6 +34,8 @@ if ! command -v tar &>/dev/null; then
 fi
 echo -e "${GREEN}OK${RESET}"
 
+INSTALL_CWD=$(pwd)
+
 # Source
 echo -n -e "${GRAY}[2/4] Preparing source... ${RESET}"
 TMP_DIR=""
@@ -55,8 +57,8 @@ echo -e "${GREEN}OK${RESET}"
 # Configure
 echo -n -e "${GRAY}[4/4] Configuring defaults... ${RESET}"
 
-if [ ! -f "commands.yaml" ] && [ ! -f "commands.yml" ]; then
-    cat <<'EOF' > commands.yaml
+if [ ! -f "$INSTALL_CWD/commands.yaml" ] && [ ! -f "$INSTALL_CWD/commands.yml" ]; then
+    cat <<'EOF' > "$INSTALL_CWD/commands.yaml"
 # command-name:
 #   description: "What this command does"
 #   steps 60:                          # 60 = timeout in seconds (optional)

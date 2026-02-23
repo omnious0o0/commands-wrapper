@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import sys
 import time
 import subprocess
@@ -7,22 +8,29 @@ import argparse
 import shlex
 import threading
 import yaml
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 try:
-    import curses  # type: ignore
+    import curses as _curses
 except Exception:  # pragma: no cover - platform dependent
-    curses = None  # type: ignore
+    _curses = None
 
 try:
-    import pexpect  # type: ignore
+    import pexpect as _pexpect
 except Exception:  # pragma: no cover - platform dependent
-    pexpect = None  # type: ignore
+    _pexpect = None
+
+CURSES_AVAILABLE = _curses is not None
+PEXPECT_AVAILABLE = _pexpect is not None
+
+curses: Any = _curses
+pexpect: Any = _pexpect
 
 ANSI_PRIMARY = "\033[38;5;67m"
 ANSI_MUTED = "\033[38;5;244m"
 ANSI_SUCCESS = "\033[38;5;108m"
 ANSI_ERROR = "\033[38;5;131m"
+ANSI_WARN = "\033[38;5;214m"
 ANSI_BOLD = "\033[1m"
 ANSI_RESET = "\033[0m"
 
@@ -38,7 +46,8 @@ def _script_bin_dir(platform_name: Optional[str] = None) -> str:
 
     plat = platform_name or os.name
     suffix = 'Scripts' if plat == 'nt' else 'bin'
-    return os.path.join(site.USER_BASE, suffix)
+    user_base = site.USER_BASE or os.path.expanduser('~')
+    return os.path.join(user_base, suffix)
 
 
 def _shell_name() -> str:
@@ -48,7 +57,7 @@ def _shell_name() -> str:
 
 
 def _has_tui_support() -> bool:
-    return curses is not None and sys.stdin.isatty() and sys.stdout.isatty()
+    return CURSES_AVAILABLE and sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _cmd_quote(value: str) -> str:
@@ -367,7 +376,7 @@ def _step_label(s: Dict) -> str:
     return "  [UNKNOWN]  unsupported step"
 
 
-def steps_editor(win, initial_steps: List[Dict] = None) -> Optional[List[Dict]]:
+def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
     """Interactive step timeline editor. Returns updated steps or None if cancelled."""
     steps = list(initial_steps or [])
     status = ""
@@ -437,9 +446,6 @@ def steps_editor(win, initial_steps: List[Dict] = None) -> Optional[List[Dict]]:
 
 def find_yamls() -> List[str]:
     roots = [os.getcwd()]
-    proj_root = os.path.dirname(_SCRIPT_DIR)
-    if proj_root not in roots:
-        roots.append(proj_root)
 
     found = []
     for r in roots:
@@ -487,6 +493,21 @@ def _ok(message: str) -> None:
     print(f"{ANSI_SUCCESS}{message}{ANSI_RESET}")
 
 
+def _warn(message: str) -> None:
+    print(f"{ANSI_WARN}Warning:{ANSI_RESET} {message}")
+
+
+def _report_sync_messages(messages: List[str]) -> bool:
+    has_errors = False
+    for message in messages:
+        if message.startswith("WARN: "):
+            _warn(message[6:])
+        else:
+            _error(message)
+            has_errors = True
+    return has_errors
+
+
 def load_cmds(files: List[str]) -> Dict[str, Dict[str, Any]]:
     cmds = {}
     for f in files:
@@ -514,26 +535,127 @@ def load_cmds(files: List[str]) -> Dict[str, Dict[str, Any]]:
     return cmds
 
 
+def _is_own_wrapper_path(path: str, target_dir: str) -> bool:
+    try:
+        real_path = os.path.realpath(path)
+    except OSError:
+        return False
+
+    if os.path.dirname(real_path) != os.path.realpath(target_dir):
+        return False
+
+    if not os.path.isfile(real_path):
+        return False
+
+    try:
+        with open(real_path, 'r', encoding='utf-8', errors='ignore') as fd:
+            header = fd.read(160)
+    except OSError:
+        return False
+
+    return WRAPPER_MARKER in header
+
+
+def _wrapper_name_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    wrapper_name = "-".join(normalized.split())
+    if not wrapper_name:
+        return None
+
+    if not all(c.isalnum() or c in '-_' for c in wrapper_name):
+        return None
+
+    if wrapper_name in ('cw', 'command-wrapper'):
+        return None
+
+    return wrapper_name
+
+
+def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+    wrappers: Dict[str, str] = {}
+    errors: List[str] = []
+
+    for key in db.keys():
+        command_name = str(key).strip()
+        wrapper_name = _wrapper_name_from_command_name(command_name)
+        if not wrapper_name:
+            continue
+
+        previous = wrappers.get(wrapper_name)
+        if previous and previous != command_name:
+            errors.append(
+                f"wrapper name collision for '{wrapper_name}': '{previous}' vs '{command_name}'"
+            )
+            continue
+
+        wrappers[wrapper_name] = command_name
+
+    return wrappers, errors
+
+
+def _build_wrapper_map_with_conflicts(
+    db: Dict[str, Any],
+    target_dir: str,
+    platform_name: str,
+) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
+    wrappers, errors = _build_wrapper_map(db)
+    filtered: Dict[str, str] = {}
+    blocked: Dict[str, str] = {}
+
+    search_path = os.environ.get('PATH')
+
+    for wrapper_name, command_name in wrappers.items():
+        if platform_name == 'nt':
+            resolved = shutil.which(wrapper_name, path=search_path)
+        else:
+            resolved = shutil.which(wrapper_name, path=search_path)
+
+        if resolved and not _is_own_wrapper_path(resolved, target_dir):
+            blocked[wrapper_name] = command_name
+            errors.append(
+                f"WARN: blocked naked wrapper '{wrapper_name}' for command '{command_name}' because it conflicts with existing command at '{resolved}'. Use 'cw {command_name}' or 'commands-wrapper {command_name}' instead."
+            )
+            continue
+
+        filtered[wrapper_name] = command_name
+
+    return filtered, errors, blocked
+
+
 
 def sync_binaries(
     db: Dict[str, Any],
     uninstall: bool = False,
     bin_dir: Optional[str] = None,
     platform_name: Optional[str] = None,
-):
+)-> List[str]:
     import stat
 
+    errors: List[str] = []
     plat = platform_name or os.name
     target_dir = bin_dir or _script_bin_dir(plat)
-    os.makedirs(target_dir, exist_ok=True)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        return [f"failed to create wrapper directory '{target_dir}': {reason}"]
 
-    expected_commands = set()
+    custom_wrappers: Dict[str, str] = {}
     if not uninstall:
-        expected_commands = {'cw', 'command-wrapper'}
-        for key in db.keys():
-            base = str(key).split()[0] if str(key).strip() else ""
-            if base and all(c.isalnum() or c in '-_' for c in base):
-                expected_commands.add(base)
+        custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, plat)
+        errors.extend(wrapper_errors)
+
+    wrapper_targets: Dict[str, Optional[str]] = {
+        'cw': None,
+        'command-wrapper': None,
+    }
+    if not uninstall:
+        wrapper_targets.update(custom_wrappers)
+
+    expected_commands = set(wrapper_targets.keys())
 
     if plat == 'nt':
         expected_files = {
@@ -545,41 +667,53 @@ def sync_binaries(
         expected_files = set(expected_commands)
 
     try:
-        for filename in os.listdir(target_dir):
-            path = os.path.join(target_dir, filename)
-            if not os.path.isfile(path):
-                continue
-            try:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
-                    header = fd.read(160)
-                if WRAPPER_MARKER in header and filename not in expected_files:
-                    os.remove(path)
-            except Exception:
-                pass
-    except Exception:
-        pass
+        existing_files = os.listdir(target_dir)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        errors.append(f"failed to list wrapper directory '{target_dir}': {reason}")
+        existing_files = []
+
+    for filename in existing_files:
+        path = os.path.join(target_dir, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
+                header = fd.read(160)
+            if WRAPPER_MARKER in header and filename not in expected_files:
+                os.remove(path)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            errors.append(f"failed to reconcile wrapper '{path}': {reason}")
 
     if uninstall:
-        return
+        return errors
 
     wrapper_target = os.path.realpath(sys.argv[0]) if os.path.isfile(sys.argv[0]) else 'commands-wrapper'
+    python_q = _cmd_quote(sys.executable)
+    target_q = _cmd_quote(wrapper_target)
+    wrapper_target_q = shlex.quote(wrapper_target)
 
-    for entry in expected_commands:
-        forwarded_args = '"$@"' if entry in ('cw', 'command-wrapper') else f'"{entry}" "$@"'
+    for entry, command_name in wrapper_targets.items():
+        if command_name is None:
+            unix_exec_line = f'exec {wrapper_target_q} "$@"\n'
+            cmd_forward = '%*'
+            ps1_forward = '@args'
+        else:
+            command_name_q = shlex.quote(command_name)
+            unix_exec_line = f'exec {wrapper_target_q} {command_name_q} "$@"\n'
+            cmd_forward = f'{_cmd_quote(command_name)} %*'
+            ps1_forward = f'{_cmd_quote(command_name)} @args'
 
         if plat == 'nt':
             cmd_path = os.path.join(target_dir, f"{entry}.cmd")
             ps1_path = os.path.join(target_dir, f"{entry}.ps1")
-            python_q = _cmd_quote(sys.executable)
-            target_q = _cmd_quote(wrapper_target)
 
-            cmd_forward = '%*' if entry in ('cw', 'command-wrapper') else f'"{entry}" %*'
             cmd_content = (
                 '@echo off\n'
                 f'REM {WRAPPER_MARKER}\n'
                 f'{python_q} {target_q} {cmd_forward}\n'
             )
-            ps1_forward = '@args' if entry in ('cw', 'command-wrapper') else f'"{entry}" @args'
             ps1_content = (
                 f'# {WRAPPER_MARKER}\n'
                 f'& {_cmd_quote(sys.executable)} {_cmd_quote(wrapper_target)} {ps1_forward}\n'
@@ -589,37 +723,43 @@ def sync_binaries(
                 try:
                     with open(wrapper_path, 'w', encoding='utf-8', newline='\n') as fd:
                         fd.write(content)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    reason = exc.strerror or str(exc)
+                    errors.append(f"failed to write wrapper '{wrapper_path}': {reason}")
         else:
             script_path = os.path.join(target_dir, entry)
-            wrapper_target_q = shlex.quote(wrapper_target)
             content = (
                 '#!/usr/bin/env bash\n'
                 f'# {WRAPPER_MARKER}\n'
-                f'exec {wrapper_target_q} {forwarded_args}\n'
+                f'{unix_exec_line}'
             )
             try:
                 with open(script_path, 'w', encoding='utf-8', newline='\n') as fd:
                     fd.write(content)
                 st = os.stat(script_path)
                 os.chmod(script_path, st.st_mode | stat.S_IEXEC)
-            except Exception:
-                pass
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                errors.append(f"failed to write wrapper '{script_path}': {reason}")
+
+    return errors
 
 def save_cmd(name: str, cfg: Dict[str, Any], file_path: str):
-    data = {}
+    data: Dict[str, Any] = {}
     if os.path.exists(file_path):
         try:
             with open(file_path, encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+                loaded = yaml.safe_load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
         except (OSError, yaml.YAMLError):
             pass
     clean_cfg = {k: v for k, v in cfg.items() if k != '_source'}
     data[name] = clean_cfg
     with open(file_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(data, f, sort_keys=False)
-    sync_binaries(load_cmds(find_yamls()))
+    sync_errors = sync_binaries(load_cmds(find_yamls()))
+    _report_sync_messages(sync_errors)
 
 
 def remove_from_file(name: str, file_path: str) -> bool:
@@ -627,12 +767,14 @@ def remove_from_file(name: str, file_path: str) -> bool:
         return False
     try:
         with open(file_path, encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
+            loaded = yaml.safe_load(f)
+            data = loaded if isinstance(loaded, dict) else {}
         if name in data:
             del data[name]
             with open(file_path, 'w', encoding='utf-8') as f:
                 yaml.safe_dump(data, f, sort_keys=False)
-            sync_binaries(load_cmds(find_yamls()))
+            sync_errors = sync_binaries(load_cmds(find_yamls()))
+            _report_sync_messages(sync_errors)
             return True
     except (OSError, yaml.YAMLError):
         pass
@@ -875,6 +1017,15 @@ class StepTimeoutError(RuntimeError):
     """Raised when a command step exceeds its timeout."""
 
 
+class CommandStepFailedError(RuntimeError):
+    """Raised when a command step exits with a non-zero status."""
+
+    def __init__(self, command: str, exit_code: int):
+        self.command = command
+        self.exit_code = exit_code
+        super().__init__(f"command failed with exit code {exit_code}: {command}")
+
+
 class ProcessAdapter:
     def isalive(self) -> bool:
         raise NotImplementedError
@@ -891,9 +1042,16 @@ class ProcessAdapter:
     def send(self, text: str) -> None:
         raise NotImplementedError
 
+    def returncode(self) -> Optional[int]:
+        raise NotImplementedError
+
+    def command_text(self) -> str:
+        raise NotImplementedError
+
 
 class PExpectProcessAdapter(ProcessAdapter):
     def __init__(self, command: str, timeout: Optional[int]):
+        self._command = command
         self._proc = pexpect.spawn(
             _shell_name(),
             ['-c', command],
@@ -929,9 +1087,20 @@ class PExpectProcessAdapter(ProcessAdapter):
     def send(self, text: str) -> None:
         self._proc.send(text)
 
+    def returncode(self) -> Optional[int]:
+        if self._proc.exitstatus is not None:
+            return self._proc.exitstatus
+        if self._proc.signalstatus is not None:
+            return 128 + self._proc.signalstatus
+        return None
+
+    def command_text(self) -> str:
+        return self._command
+
 
 class SubprocessProcessAdapter(ProcessAdapter):
     def __init__(self, command: str, timeout: Optional[int]):
+        self._command = command
         self._timeout = timeout
         kwargs: Dict[str, Any] = {
             'stdin': subprocess.PIPE,
@@ -999,9 +1168,34 @@ class SubprocessProcessAdapter(ProcessAdapter):
         self._proc.stdin.write(text)
         self._proc.stdin.flush()
 
+    def returncode(self) -> Optional[int]:
+        return self._proc.returncode
+
+    def command_text(self) -> str:
+        return self._command
+
+
+def _safe_exit_code(code: int) -> int:
+    if 0 < code < 256:
+        return code
+    return 1
+
+
+def _finalize_process(proc: ProcessAdapter) -> None:
+    try:
+        proc.interact()
+    finally:
+        proc.close()
+
+    code = proc.returncode()
+    if code is None:
+        raise ValueError(f"unable to determine exit status for command: {proc.command_text()}")
+    if code != 0:
+        raise CommandStepFailedError(proc.command_text(), code)
+
 
 def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
-    if pexpect is not None and os.name != 'nt':
+    if PEXPECT_AVAILABLE and os.name != 'nt':
         return PExpectProcessAdapter(command, timeout)
     return SubprocessProcessAdapter(command, timeout)
 
@@ -1011,11 +1205,8 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
         command_text = str(ctx['command'])
         cd_target = _extract_cd_target(command_text)
 
-        if proc and proc.isalive():
-            try:
-                proc.interact()
-            finally:
-                proc.close()
+        if proc is not None:
+            _finalize_process(proc)
 
         if cd_target is not None:
             _change_directory(cd_target)
@@ -1079,7 +1270,7 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
 
     single_cd_step = _is_single_cd_step(steps)
 
-    proc = None
+    proc: Optional[ProcessAdapter] = None
     try:
         for s in steps:
             if not isinstance(s, dict):
@@ -1088,18 +1279,22 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
     except ValueError as exc:
         _error(str(exc))
         sys.exit(1)
+    except CommandStepFailedError as exc:
+        _error(str(exc))
+        sys.exit(_safe_exit_code(exc.exit_code))
     except StepTimeoutError:
         _error(f"command '{name}' timed out.")
         sys.exit(1)
 
-    if proc and proc.isalive():
+    if proc is not None:
         try:
-            proc.interact()
+            _finalize_process(proc)
+        except CommandStepFailedError as exc:
+            _error(str(exc))
+            sys.exit(_safe_exit_code(exc.exit_code))
         except StepTimeoutError:
             _error(f"command '{name}' timed out.")
             sys.exit(1)
-        finally:
-            proc.close()
     elif single_cd_step and sys.stdin.isatty() and sys.stdout.isatty():
         try:
             _open_interactive_shell()
@@ -1123,32 +1318,41 @@ def print_list(db: Dict):
 def cmd_add_yaml(yaml_str: str):
     try:
         data = yaml.safe_load(yaml_str)
-        if not isinstance(data, dict):
-            raise ValueError("Input must be a YAML mapping.")
-        target = os.path.join(os.getcwd(), 'commands.yaml')
-        for name, cfg in data.items():
-            if not isinstance(cfg, dict):
-                continue
-            if not _is_valid_name(str(name).strip()):
-                _error(f"skipping '{name}': invalid command name")
-                continue
-            steps_key = _get_steps_key(cfg)
-            if not steps_key:
-                _error(f"skipping '{name}': no steps key found")
-                continue
-            if not isinstance(cfg.get(steps_key), list):
-                _error(f"skipping '{name}': steps value must be a list")
-                continue
-            try:
-                _parse_timeout(steps_key)
-            except ValueError as exc:
-                _error(f"skipping '{name}': {exc}")
-                continue
-            save_cmd(name, cfg, target)
-            _ok(f"Added '{name}' to {target}")
-    except Exception as e:
-        _error(f"YAML parse error: {e}")
+    except yaml.YAMLError as exc:
+        _error(f"YAML parse error: {exc}")
         sys.exit(1)
+
+    if not isinstance(data, dict):
+        _error("Input must be a YAML mapping.")
+        sys.exit(1)
+
+    target = os.path.join(os.getcwd(), 'commands.yaml')
+    for name, cfg in data.items():
+        if not isinstance(cfg, dict):
+            continue
+
+        normalized_name = str(name).strip()
+        if not _is_valid_name(normalized_name):
+            _error(f"skipping '{name}': invalid command name")
+            continue
+
+        steps_key = _get_steps_key(cfg)
+        if not steps_key:
+            _error(f"skipping '{name}': no steps key found")
+            continue
+
+        if not isinstance(cfg.get(steps_key), list):
+            _error(f"skipping '{name}': steps value must be a list")
+            continue
+
+        try:
+            _parse_timeout(steps_key)
+        except ValueError as exc:
+            _error(f"skipping '{name}': {exc}")
+            continue
+
+        save_cmd(normalized_name, cfg, target)
+        _ok(f"Added '{normalized_name}' to {target}")
 
 
 def _pip_install():
@@ -1161,7 +1365,8 @@ def _pip_install():
 
 
 def _pip_uninstall():
-    sync_binaries({}, uninstall=True)
+    sync_errors = sync_binaries({}, uninstall=True)
+    _report_sync_messages(sync_errors)
     return_code = _run_pip(['uninstall', 'commands-wrapper', '-y'])
     if return_code == 0:
         _ok("Uninstalled commands-wrapper.")
@@ -1185,8 +1390,11 @@ def _auto_update():
     url = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
     return_code = _run_pip(['install', '--upgrade', '--force-reinstall', url], suppress_output=True)
     if return_code == 0:
-        sync_binaries(load_cmds(find_yamls()))
-        _ok("Update complete.")
+        sync_errors = sync_binaries(load_cmds(find_yamls()))
+        if _report_sync_messages(sync_errors):
+            return_code = 1
+        else:
+            _ok("Update complete.")
     else:
         _error("update failed")
     sys.exit(return_code)
@@ -1221,6 +1429,12 @@ def main():
         return
 
     action = action_parts[0]
+    full_action = " ".join(action_parts)
+
+    db = load_cmds(find_yamls())
+    if full_action in db:
+        exec_cmd(full_action, db[full_action])
+        return
 
     if action in ('-h', '--help'):
         p.print_help()
@@ -1229,30 +1443,29 @@ def main():
         _auto_update()
 
     elif action in ('ls', 'list'):
-        db = load_cmds(find_yamls())
         print_list(db)
 
     elif action == 'hook':
-        db = load_cmds(find_yamls())
+        target_dir = _script_bin_dir(os.name)
+        wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, os.name)
+        _report_sync_messages(wrapper_errors)
         if os.name == 'nt':
             print('doskey cw=commands-wrapper $*')
             print('doskey command-wrapper=commands-wrapper $*')
-            for k in sorted(db.keys()):
-                base = str(k).split()[0] if str(k).strip() else ""
-                if base and all(c.isalnum() or c in '-_' for c in base):
-                    print(f'doskey {base}=commands-wrapper {base} $*')
+            for wrapper_name, command_name in sorted(wrappers.items()):
+                print(f'doskey {wrapper_name}=commands-wrapper {_cmd_quote(command_name)} $*')
         else:
             print("alias cw='commands-wrapper'")
             print("alias command-wrapper='commands-wrapper'")
-            for k in sorted(db.keys()):
-                base = str(k).split()[0] if str(k).strip() else ""
-                if base and all(c.isalnum() or c in '-_' for c in base):
-                    print(f"alias {base}='commands-wrapper {base}'")
+            for wrapper_name, command_name in sorted(wrappers.items()):
+                quoted_command = shlex.quote(command_name)
+                print(f"alias {wrapper_name}=\"commands-wrapper {quoted_command}\"")
 
     elif action == 'sync':
-        db = load_cmds(find_yamls())
         is_uninstall = "--uninstall" in sys.argv
-        sync_binaries(db, uninstall=is_uninstall)
+        sync_errors = sync_binaries(db, uninstall=is_uninstall)
+        if _report_sync_messages(sync_errors):
+            sys.exit(1)
         if not is_uninstall:
             _ok("Synced binary wrappers.")
 
@@ -1273,7 +1486,6 @@ def main():
         if len(action_parts) < 2:
             _error(f"Usage: commands-wrapper {action} <name>")
             sys.exit(1)
-        db = load_cmds(find_yamls())
         name = action_parts[1]
         if name not in db:
             _error(f"'{name}' not found")
@@ -1282,8 +1494,8 @@ def main():
             _ok(f"Removed '{name}'.")
 
     else:
-        db = load_cmds(find_yamls())
         full = " ".join(action_parts)
+
         target = full if full in db else action if action in db else None
         if target:
             exec_cmd(target, db[target])

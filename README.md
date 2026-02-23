@@ -9,8 +9,8 @@
 - ✅ Windows (PowerShell + CMD wrappers)
 
 Generated wrappers:
-- Linux/macOS: `cw`, `command-wrapper`, and command-name shims in `~/.local/bin`
-- Windows: `.cmd` and `.ps1` shims in `%APPDATA%\Python\...\Scripts`
+- Linux/macOS: `cw`, `command-wrapper`, and command-name shims in your Python user `bin` directory (commonly `~/.local/bin`)
+- Windows: `.cmd` and `.ps1` shims in your Python user `Scripts` directory
 
 ## Installation
 
@@ -20,17 +20,21 @@ Generated wrappers:
 curl -sSL https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh | bash
 ```
 
+If your environment requires stricter controls, download and review the script before executing it.
+
 ### Windows (PowerShell)
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.ps1 | iex
 ```
 
-### pip (all OS)
+### pip (all OS, from GitHub source)
 
 ```bash
-python -m pip install commands-wrapper
+python -m pip install "commands-wrapper @ https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 ```
+
+`commands-wrapper` is currently distributed from GitHub source (not PyPI).
 
 ## Usage
 
@@ -107,6 +111,21 @@ commands-wrapper remove <command-name>
 ```bash
 commands-wrapper sync
 commands-wrapper sync --uninstall
+```
+
+If a generated naked wrapper name conflicts with an existing command on your `PATH`,
+commands-wrapper skips that wrapper and prints a warning. Use:
+
+```bash
+cw <command-name>
+commands-wrapper <command-name>
+```
+
+### Update
+
+```bash
+commands-wrapper update
+commands-wrapper upd
 ```
 
 ### Hook output for shell init
