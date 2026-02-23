@@ -113,6 +113,66 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertFalse(any(msg.startswith("WARN:") for msg in messages))
             self.assertTrue((target_bin / cw.SHORT_ALIAS).is_file())
 
+    def test_wrapper_name_from_command_name_normalizes_case(self):
+        self.assertEqual(cw._wrapper_name_from_command_name("My Cmd"), "my-cmd")
+
+    def test_build_command_lookup_index_detects_case_collisions(self):
+        index, errors = cw._build_command_lookup_index({"OAA": {}, "oaa": {}})
+
+        self.assertIn("oaa", index)
+        self.assertTrue(errors)
+        self.assertIn("case-insensitive command name collision", errors[0])
+
+    def test_resolve_command_name_case_insensitive(self):
+        db = {
+            "OAA": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+        lookup_index, errors = cw._build_command_lookup_index(db)
+
+        self.assertFalse(errors)
+        self.assertEqual(cw._resolve_command_name("oaa", db, lookup_index), "OAA")
+
+    def test_main_executes_case_insensitive_single_word_command(self):
+        db = {
+            "OAA": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with mock.patch.object(cw, "load_cmds", return_value=db), mock.patch.object(
+            cw, "sync_binaries", return_value=[]
+        ), mock.patch.object(
+            cw, "_report_sync_messages", return_value=False
+        ), mock.patch.object(cw, "exec_cmd") as exec_mock, mock.patch.object(
+            sys, "argv", ["commands-wrapper", "oaa"]
+        ):
+            cw.main()
+
+        exec_mock.assert_called_once_with("OAA", db["OAA"])
+
+    def test_main_executes_case_insensitive_multi_word_command(self):
+        db = {
+            "claw upd": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with mock.patch.object(cw, "load_cmds", return_value=db), mock.patch.object(
+            cw, "sync_binaries", return_value=[]
+        ), mock.patch.object(
+            cw, "_report_sync_messages", return_value=False
+        ), mock.patch.object(cw, "exec_cmd") as exec_mock, mock.patch.object(
+            sys, "argv", ["commands-wrapper", "CLAW", "UPD"]
+        ):
+            cw.main()
+
+        exec_mock.assert_called_once_with("claw upd", db["claw upd"])
+
     def test_main_list_uses_non_conflict_sync_path(self):
         with mock.patch.object(cw, "load_cmds", return_value={}), mock.patch.object(
             cw, "sync_binaries", return_value=[]
