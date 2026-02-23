@@ -48,7 +48,8 @@ If a full TUI is unavailable in the current shell, the command falls back to non
 
 The TUI opens directly into your command list for quick editing:
 - `+ Add new command` is always shown at the top.
-- Press `Enter` on any command row to edit metadata, steps, or delete it.
+- Press `Enter` on any command row to rename it, edit metadata, edit steps, or delete it.
+- Existing steps support direct content editing (not only move/delete).
 - `Refresh list` and `Exit` are available in the same screen.
 
 Command definitions are discovered from:

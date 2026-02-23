@@ -463,6 +463,44 @@ def _step_label(s: Dict) -> str:
     return "  [UNKNOWN]  unsupported step"
 
 
+def _edit_existing_step(win, step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if 'command' in step:
+        res = form_input(win, "Edit step", [Field("val", "Command:", value=str(step['command']), multiline=True, box_h=7)])
+        if not res or not res["val"]:
+            return None
+        return {"command": res["val"]}
+
+    if 'send' in step:
+        res = form_input(win, "Edit step", [Field("val", "Text to send:", value=str(step['send']), multiline=True, box_h=5)])
+        if not res or not res["val"]:
+            return None
+        return {"send": res["val"]}
+
+    if 'press_key' in step:
+        res = form_input(win, "Edit step", [Field("val", "Key (e.g. enter, tab, esc):", value=str(step['press_key']))])
+        if not res or not res["val"]:
+            return None
+        return {"press_key": res["val"]}
+
+    if 'wait' in step:
+        res = form_input(win, "Edit step", [Field("val", "Duration (seconds):", value=str(step['wait']))])
+        if not res or not res["val"]:
+            return None
+
+        wait_value = res["val"].strip()
+        try:
+            wait_duration = float(wait_value)
+        except ValueError:
+            return {"_error": "ERR: Wait must be a number"}
+
+        if wait_duration < 0:
+            return {"_error": "ERR: Wait must be non-negative"}
+
+        return {"wait": wait_value}
+
+    return None
+
+
 def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[List[Dict]]:
     """Interactive step timeline editor. Returns updated steps or None if cancelled."""
     steps = list(initial_steps or [])
@@ -527,18 +565,28 @@ def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[Li
 
         else:
             action = menu(win, f"Step {choice + 1}: {_step_label(steps[choice]).strip()}", [
+                "Edit",
                 "Move up",
                 "Move down",
                 "Delete",
                 "Cancel",
             ])
-            if action == 0 and choice > 0:
+            if action == 0:
+                edited = _edit_existing_step(win, steps[choice])
+                if edited is None:
+                    continue
+                if "_error" in edited:
+                    status = str(edited["_error"])
+                    continue
+                steps[choice] = edited
+                status = "OK: Step updated"
+            elif action == 1 and choice > 0:
                 steps[choice], steps[choice - 1] = steps[choice - 1], steps[choice]
                 status = "OK: Moved up"
-            elif action == 1 and choice < len(steps) - 1:
+            elif action == 2 and choice < len(steps) - 1:
                 steps[choice], steps[choice + 1] = steps[choice + 1], steps[choice]
                 status = "OK: Moved down"
-            elif action == 2:
+            elif action == 3:
                 steps.pop(choice)
                 status = "OK: Step removed"
 
@@ -912,6 +960,36 @@ def remove_from_file(name: str, file_path: str) -> Tuple[bool, List[str]]:
     return False, []
 
 
+def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, str, List[str]]:
+    if not os.path.exists(file_path):
+        return False, f"source file not found: {file_path}", []
+
+    try:
+        with open(file_path, encoding='utf-8') as f:
+            loaded = yaml.safe_load(f)
+            data = loaded if isinstance(loaded, dict) else {}
+    except (OSError, yaml.YAMLError) as exc:
+        return False, f"failed to read source file: {exc}", []
+
+    if old_name not in data:
+        return False, f"'{old_name}' not found in source file", []
+
+    if new_name != old_name and new_name in data:
+        return False, f"'{new_name}' already exists in source file", []
+
+    if new_name != old_name:
+        data[new_name] = data.pop(old_name)
+
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+    except OSError as exc:
+        return False, f"failed to write source file: {exc}", []
+
+    sync_messages = sync_binaries(load_cmds(find_yamls()))
+    return True, "", sync_messages
+
+
 def _is_valid_name(name: str) -> bool:
     """Command names must be non-empty and contain only safe characters."""
     return bool(name) and all(c.isalnum() or c in '-_ ' for c in name) and not name.isspace()
@@ -934,6 +1012,16 @@ def _wizard_add(win) -> bool:
             y = _draw_header(win, "Add command")
             _addstr(win, y, 4, "Invalid command name. Use letters, numbers, spaces, '-' or '_'.", ERR())
             _addstr(win, y + 2, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+            continue
+
+        existing = load_cmds(find_yamls())
+        if name in existing:
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, f"Command '{name}' already exists.", ERR())
+            _addstr(win, y + 2, 4, "Use edit mode from the command list to update it.", DIM())
+            _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
             win.refresh()
             win.getch()
             continue
@@ -977,14 +1065,16 @@ def _menu_line_for_command(name: str, cfg: Dict[str, Any]) -> str:
 
 def _wizard_edit_command(win, name: str) -> str:
     status = ""
+    current_name = name
 
     while True:
         db = load_cmds(find_yamls())
-        cfg = db.get(name)
+        cfg = db.get(current_name)
         if not cfg:
-            return f"OK: Removed '{name}'."
+            return f"OK: Removed '{current_name}'."
 
-        action = menu(win, f"Edit - {name}", [
+        action = menu(win, f"Edit - {current_name}", [
+            "Rename command",
             "Edit metadata",
             "Edit steps",
             "Delete",
@@ -992,10 +1082,34 @@ def _wizard_edit_command(win, name: str) -> str:
         ], status)
         status = ""
 
-        if action is None or action == 3:
+        if action is None or action == 4:
             return ""
 
         if action == 0:
+            res = form_input(win, f"Rename - {current_name}", [Field("name", "Command name", value=current_name)])
+            if not res:
+                continue
+
+            new_name = res["name"].strip()
+            if not _is_valid_name(new_name):
+                status = "ERR: Invalid command name"
+                continue
+
+            if new_name != current_name and new_name in db:
+                status = f"ERR: Command '{new_name}' already exists"
+                continue
+
+            renamed, err_message, sync_messages = rename_in_file(current_name, new_name, cfg['_source'])
+            if not renamed:
+                status = f"ERR: {err_message}"
+                continue
+
+            current_name = new_name
+            status = "OK: Command renamed."
+            if _report_sync_messages(sync_messages, emit=False):
+                status = "WARN: Command renamed with sync issues."
+
+        elif action == 1:
             old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
             old_timeout = str(old_steps_key).replace('steps', '').strip()
 
@@ -1003,7 +1117,7 @@ def _wizard_edit_command(win, name: str) -> str:
                 Field("desc", "Description", value=cfg.get('description', '')),
                 Field("timeout", "Timeout (seconds)", value=old_timeout),
             ]
-            res = form_input(win, f"Edit metadata - {name}", fields)
+            res = form_input(win, f"Edit metadata - {current_name}", fields)
             if not res:
                 continue
 
@@ -1019,33 +1133,33 @@ def _wizard_edit_command(win, name: str) -> str:
             if steps_key != old_steps_key:
                 cfg[steps_key] = cfg.pop(old_steps_key)
 
-            sync_messages = save_cmd(name, cfg, cfg['_source'])
+            sync_messages = save_cmd(current_name, cfg, cfg['_source'])
             status = "OK: Metadata updated."
             if _report_sync_messages(sync_messages, emit=False):
                 status = "WARN: Metadata saved with sync issues."
 
-        elif action == 1:
+        elif action == 2:
             old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
             existing_steps = cfg.get(old_steps_key, [])
             steps = steps_editor(win, existing_steps)
             if steps is not None:
                 cfg[old_steps_key] = steps
-                sync_messages = save_cmd(name, cfg, cfg['_source'])
+                sync_messages = save_cmd(current_name, cfg, cfg['_source'])
                 status = "OK: Steps updated."
                 if _report_sync_messages(sync_messages, emit=False):
                     status = "WARN: Steps saved with sync issues."
 
-        elif action == 2:
-            confirm = menu(win, f"Delete '{name}'?", ["Cancel", "Delete"])
+        elif action == 3:
+            confirm = menu(win, f"Delete '{current_name}'?", ["Cancel", "Delete"])
             if confirm == 1:
-                removed, sync_messages = remove_from_file(name, cfg['_source'])
+                removed, sync_messages = remove_from_file(current_name, cfg['_source'])
                 if not removed:
                     status = "ERR: Failed to remove command."
                     continue
 
                 if _report_sync_messages(sync_messages, emit=False):
-                    return f"WARN: Removed '{name}' with sync issues."
-                return f"OK: Removed '{name}'."
+                    return f"WARN: Removed '{current_name}' with sync issues."
+                return f"OK: Removed '{current_name}'."
 
 
 def _wizard_main(win):
@@ -1092,7 +1206,7 @@ def _wizard_main(win):
         refresh_idx = first_command_idx + command_count
         exit_idx = refresh_idx + 1
 
-        choice = menu(win, "Command wrappers", options, status)
+        choice = menu(win, "Command wrappers (Enter edits)", options, status)
         status = ""
 
         if choice is None or choice == exit_idx:
