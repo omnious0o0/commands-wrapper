@@ -46,6 +46,19 @@ commands-wrapper configure
 
 If a full TUI is unavailable in the current shell, the command falls back to non-interactive guidance.
 
+The TUI opens directly into your command list for quick editing:
+- `+ Add new command` is always shown at the top.
+- Press `Enter` on any command row to edit metadata, steps, or delete it.
+- `Refresh list` and `Exit` are available in the same screen.
+
+Command definitions are discovered from:
+- Current working directory (`commands.yaml`, `commands.yml`, and local `.commands-wrapper/*.yml`)
+- User config directories (`$XDG_CONFIG_HOME/commands-wrapper` or `~/.config/commands-wrapper`, plus legacy `~/.commands-wrapper`)
+
+When command names overlap, local project definitions take precedence over user/global definitions.
+
+When adding commands and no local config exists, commands-wrapper writes to your user config path by default.
+
 ### YAML format
 
 ```yaml
@@ -106,12 +119,10 @@ commands-wrapper list
 commands-wrapper remove <command-name>
 ```
 
-### Sync wrappers
+### Wrapper sync
 
-```bash
-commands-wrapper sync
-commands-wrapper sync --uninstall
-```
+Wrapper generation and cleanup are automatic whenever commands-wrapper runs or when
+you add/edit/remove commands.
 
 If a generated naked wrapper name conflicts with an existing command on your `PATH`,
 commands-wrapper skips that wrapper and prints a warning. Use:

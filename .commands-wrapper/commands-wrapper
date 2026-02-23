@@ -50,6 +50,45 @@ def _script_bin_dir(platform_name: Optional[str] = None) -> str:
     return os.path.join(user_base, suffix)
 
 
+def _user_config_dir(platform_name: Optional[str] = None) -> str:
+    plat = platform_name or os.name
+    if plat == 'nt':
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+        return os.path.join(base, 'commands-wrapper')
+
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    if xdg:
+        return os.path.join(os.path.expanduser(xdg), 'commands-wrapper')
+    return os.path.join(os.path.expanduser('~'), '.config', 'commands-wrapper')
+
+
+def _legacy_config_dir() -> str:
+    return os.path.join(os.path.expanduser('~'), '.commands-wrapper')
+
+
+def _command_file_candidates(root: str) -> List[str]:
+    return [os.path.join(root, 'commands.yaml'), os.path.join(root, 'commands.yml')]
+
+
+def _preferred_command_file_for_write() -> str:
+    cwd = os.getcwd()
+
+    for candidate in _command_file_candidates(cwd):
+        if os.path.isfile(candidate):
+            return candidate
+
+    global_candidates = [
+        *_command_file_candidates(_user_config_dir()),
+        *_command_file_candidates(_legacy_config_dir()),
+    ]
+
+    for candidate in global_candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    return global_candidates[0]
+
+
 def _shell_name() -> str:
     if os.name == 'nt':
         return os.environ.get('COMSPEC', 'cmd.exe')
@@ -65,13 +104,19 @@ def _cmd_quote(value: str) -> str:
 
 
 def _init_colors():
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK, 67)
-    curses.init_pair(3, 244, -1)
-    curses.init_pair(4, 108, -1)
-    curses.init_pair(5, 131, -1)
-    curses.init_pair(6, 67, -1)
+    if not curses.has_colors():
+        return
+
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(3, 244, -1)
+        curses.init_pair(4, 108, -1)
+        curses.init_pair(5, 131, -1)
+        curses.init_pair(6, 67, -1)
+    except curses.error:
+        pass
 
 SEL = lambda: curses.color_pair(1) | curses.A_BOLD
 DIM = lambda: curses.color_pair(3)
@@ -136,24 +181,48 @@ def _draw_header(win, title: str, compact: bool = False):
 
 def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]:
     """Arrow-key navigable menu. Returns selected index or None if cancelled."""
+    if not options:
+        return None
+
     cur = 0
+    top = 0
     while True:
         y_offset = _draw_header(win, title)
         h, w = win.getmaxyx()
+        visible_rows = max(1, h - y_offset - 3)
 
-        for i, opt in enumerate(options):
-            row = y_offset + i
-            if row >= h - 3:
-                break
+        if cur < top:
+            top = cur
+        elif cur >= top + visible_rows:
+            top = cur - visible_rows + 1
+
+        item_width = max(24, min(w - 8, max((len(opt) for opt in options), default=0) + 6))
+
+        bottom = min(len(options), top + visible_rows)
+        for row_index, i in enumerate(range(top, bottom)):
+            row = y_offset + row_index
+            opt = options[i]
             if i == cur:
-                _addstr(win, row, 4, f"  {opt}  ".ljust(40), SEL())
+                _addstr(win, row, 4, f"  {opt}  ".ljust(item_width), SEL())
             else:
-                _addstr(win, row, 6, opt, 0)
+                _addstr(win, row, 6, opt, DIM())
 
-        hint = " ↑↓ navigate   ENTER select   ESC back "
+        if top > 0:
+            _addstr(win, y_offset - 1, w - 5, "^", DIM())
+        if bottom < len(options):
+            _addstr(win, y_offset + visible_rows, w - 5, "v", DIM())
+
+        hint = " ↑↓/j/k navigate   ENTER select   ESC back "
         _addstr(win, h - 2, 2, hint, DIM())
         if status:
-            _addstr(win, h - 3, 2, status, OK() if status.startswith("OK:") else ERR())
+            status_attr = ERR()
+            if status.startswith("OK:"):
+                status_attr = OK()
+            elif status.startswith("WARN:"):
+                status_attr = HDR()
+            elif status.startswith("INFO:"):
+                status_attr = DIM()
+            _addstr(win, h - 3, 2, status, status_attr)
 
         win.refresh()
         key = win.getch()
@@ -192,7 +261,7 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
 
     prev_cursor: Optional[int] = None
     try:
-        prev_cursor = curses.curs_set(1)
+        prev_cursor = curses.curs_set(0)
     except curses.error:
         prev_cursor = None
     try:
@@ -288,15 +357,6 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
                 pad.refresh(form_scroll, 0, r_y1, r_x1, r_y2, r_x2)
             except curses.error:
                 pass
-
-            active_f = fields[focus]
-            cy = y_hdr + (active_f.top_y - form_scroll) + 1 + (active_f.cur_y - active_f.view_y)
-            cx = 6 + (active_f.cur_x - active_f.view_x)
-            if 0 <= cy < h and 0 <= cx < w:
-                try:
-                    win.move(cy, cx)
-                except curses.error:
-                    pass
 
             h_hint = " TAB nav  ENTER next  Ctrl+S save  ESC cancel "
             if focus_mode:
@@ -424,10 +484,10 @@ def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[Li
 
         if choice == len(steps):
             stype = menu(win, "Step type", [
-                "command   — run a shell command",
-                "send      — type text into running process",
-                "press_key — send a special key",
-                "wait      — pause execution",
+                "command   : run a shell command",
+                "send      : type text into running process",
+                "press_key : send a special key",
+                "wait      : pause execution",
             ])
             if stype is None:
                 continue
@@ -451,7 +511,18 @@ def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[Li
             elif stype == 3:
                 res = form_input(win, title, [Field("val", "Duration (seconds):")])
                 if res and res["val"]:
-                    steps.append({"wait": res["val"]})
+                    wait_value = res["val"].strip()
+                    try:
+                        wait_duration = float(wait_value)
+                    except ValueError:
+                        status = "ERR: Wait must be a number"
+                        continue
+
+                    if wait_duration < 0:
+                        status = "ERR: Wait must be non-negative"
+                        continue
+
+                    steps.append({"wait": wait_value})
                     status = "OK: Step added"
 
         else:
@@ -471,24 +542,51 @@ def steps_editor(win, initial_steps: Optional[List[Dict]] = None) -> Optional[Li
                 steps.pop(choice)
                 status = "OK: Step removed"
 
-def find_yamls() -> List[str]:
-    roots = [os.getcwd()]
+def _scan_yaml_files(directory: str) -> List[str]:
+    if not os.path.isdir(directory):
+        return []
 
-    found = []
-    for r in roots:
-        candidates = [os.path.join(r, 'commands.yaml'), os.path.join(r, 'commands.yml')]
-        for d in ('.commands-wrapper', 'commands-wrapper'):
-            tgt = os.path.join(r, d)
-            if os.path.isdir(tgt):
-                try:
-                    candidates.extend(
-                        os.path.join(tgt, f) for f in os.listdir(tgt)
-                        if f.endswith(('.yaml', '.yml')) and not f.startswith('.')
-                    )
-                except PermissionError:
-                    pass
-        found.extend(p for p in set(candidates) if os.path.isfile(p))
-    return sorted(dict.fromkeys(found))
+    results: List[str] = []
+    try:
+        for entry in os.listdir(directory):
+            if entry.startswith('.'):
+                continue
+            if not entry.endswith(('.yaml', '.yml')):
+                continue
+            path = os.path.join(directory, entry)
+            if os.path.isfile(path):
+                results.append(path)
+    except PermissionError:
+        return []
+
+    return results
+
+
+def find_yamls() -> List[str]:
+    cwd = os.getcwd()
+    roots = list(dict.fromkeys([_legacy_config_dir(), _user_config_dir(), cwd]))
+
+    found: List[str] = []
+    for root in roots:
+        candidates = list(_command_file_candidates(root))
+
+        if root == cwd:
+            for d in ('.commands-wrapper', 'commands-wrapper'):
+                candidates.extend(_scan_yaml_files(os.path.join(root, d)))
+        else:
+            candidates.extend(_scan_yaml_files(root))
+
+        found.extend(path for path in candidates if os.path.isfile(path))
+
+    ordered: List[str] = []
+    seen = set()
+    for path in found:
+        if path in seen:
+            continue
+        seen.add(path)
+        ordered.append(path)
+
+    return ordered
 
 
 def _is_steps_key(key: Any) -> bool:
@@ -521,16 +619,18 @@ def _ok(message: str) -> None:
 
 
 def _warn(message: str) -> None:
-    print(f"{ANSI_WARN}Warning:{ANSI_RESET} {message}")
+    sys.stderr.write(f"{ANSI_WARN}Warning:{ANSI_RESET} {message}\n")
 
 
-def _report_sync_messages(messages: List[str]) -> bool:
+def _report_sync_messages(messages: List[str], emit: bool = True) -> bool:
     has_errors = False
     for message in messages:
         if message.startswith("WARN: "):
-            _warn(message[6:])
+            if emit:
+                _warn(message[6:])
         else:
-            _error(message)
+            if emit:
+                _error(message)
             has_errors = True
     return has_errors
 
@@ -675,11 +775,12 @@ def sync_binaries(
         custom_wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir, plat)
         errors.extend(wrapper_errors)
 
-    wrapper_targets: Dict[str, Optional[str]] = {
-        'cw': None,
-        'command-wrapper': None,
-    }
+    wrapper_targets: Dict[str, Optional[str]] = {}
     if not uninstall:
+        wrapper_targets = {
+            'cw': None,
+            'command-wrapper': None,
+        }
         wrapper_targets.update(custom_wrappers)
 
     expected_commands = set(wrapper_targets.keys())
@@ -771,7 +872,7 @@ def sync_binaries(
 
     return errors
 
-def save_cmd(name: str, cfg: Dict[str, Any], file_path: str):
+def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
     data: Dict[str, Any] = {}
     if os.path.exists(file_path):
         try:
@@ -781,17 +882,21 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str):
                     data = loaded
         except (OSError, yaml.YAMLError):
             pass
+
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     clean_cfg = {k: v for k, v in cfg.items() if k != '_source'}
     data[name] = clean_cfg
     with open(file_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(data, f, sort_keys=False)
-    sync_errors = sync_binaries(load_cmds(find_yamls()))
-    _report_sync_messages(sync_errors)
+    return sync_binaries(load_cmds(find_yamls()))
 
 
-def remove_from_file(name: str, file_path: str) -> bool:
+def remove_from_file(name: str, file_path: str) -> Tuple[bool, List[str]]:
     if not os.path.exists(file_path):
-        return False
+        return False, []
     try:
         with open(file_path, encoding='utf-8') as f:
             loaded = yaml.safe_load(f)
@@ -801,11 +906,10 @@ def remove_from_file(name: str, file_path: str) -> bool:
             with open(file_path, 'w', encoding='utf-8') as f:
                 yaml.safe_dump(data, f, sort_keys=False)
             sync_errors = sync_binaries(load_cmds(find_yamls()))
-            _report_sync_messages(sync_errors)
-            return True
+            return True, sync_errors
     except (OSError, yaml.YAMLError):
         pass
-    return False
+    return False, []
 
 
 def _is_valid_name(name: str) -> bool:
@@ -813,7 +917,7 @@ def _is_valid_name(name: str) -> bool:
     return bool(name) and all(c.isalnum() or c in '-_ ' for c in name) and not name.isspace()
 
 
-def _wizard_add(win):
+def _wizard_add(win) -> bool:
     fields = [
         Field("name", "Command"),
         Field("desc", "Description"),
@@ -823,7 +927,7 @@ def _wizard_add(win):
     while True:
         res = form_input(win, "Add command", fields)
         if not res:
-            return
+            return False
 
         name = res['name'].strip()
         if not _is_valid_name(name):
@@ -836,99 +940,186 @@ def _wizard_add(win):
 
         steps = steps_editor(win, [])
         if steps is None:
-            return
+            return False
 
         timeout = res['timeout'].strip()
         steps_key = f"steps {timeout}" if timeout else "steps"
-        target = os.path.join(os.getcwd(), 'commands.yaml')
-        save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
-        return
-
-
-def _wizard_edit(win, db: Dict):
-    while True:
-        if not db:
-            y = _draw_header(win, "Edit command")
-            _addstr(win, y, 4, "No commands found.", DIM())
+        try:
+            _parse_timeout(steps_key)
+        except ValueError:
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, "Invalid timeout. Use a positive integer or leave empty.", ERR())
+            _addstr(win, y + 2, 4, "Press any key to continue.", DIM())
             win.refresh()
-            time.sleep(1.5)
-            return
+            win.getch()
+            continue
 
-        keys = sorted(db.keys())
-        choice = menu(win, "Edit command", keys)
-        if choice is None:
-            return
+        target = _preferred_command_file_for_write()
+        sync_messages = save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
+        if _report_sync_messages(sync_messages, emit=False):
+            y = _draw_header(win, "Add command")
+            _addstr(win, y, 4, f"Saved to {target}", DIM())
+            _addstr(win, y + 2, 4, "Some wrappers could not be synced automatically. Check warnings in terminal output.", ERR())
+            _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
+            win.refresh()
+            win.getch()
+        return True
 
-        name = keys[choice]
-        cfg = db[name]
 
-        while True:
-            action = menu(win, f"  {name}", [
-                "Edit metadata",
-                "Edit steps",
-                "Delete",
-                "Back",
-            ])
+def _menu_line_for_command(name: str, cfg: Dict[str, Any]) -> str:
+    name_col = name if len(name) <= 24 else f"{name[:21]}..."
+    desc = str(cfg.get('description', '')).strip()
+    if not desc:
+        return f"{name_col:<24} |"
+    short_desc = desc if len(desc) <= 56 else f"{desc[:53]}..."
+    return f"{name_col:<24} | {short_desc}"
 
-            if action is None or action == 3:
-                break
 
-            if action == 0:
-                old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
-                old_timeout = str(old_steps_key).replace('steps', '').strip()
+def _wizard_edit_command(win, name: str) -> str:
+    status = ""
 
-                fields = [
-                    Field("desc", "Description", value=cfg.get('description', '')),
-                    Field("timeout", "Timeout (seconds)", value=old_timeout),
-                ]
-                res = form_input(win, f"Edit metadata — {name}", fields)
-                if not res:
+    while True:
+        db = load_cmds(find_yamls())
+        cfg = db.get(name)
+        if not cfg:
+            return f"OK: Removed '{name}'."
+
+        action = menu(win, f"Edit - {name}", [
+            "Edit metadata",
+            "Edit steps",
+            "Delete",
+            "Back",
+        ], status)
+        status = ""
+
+        if action is None or action == 3:
+            return ""
+
+        if action == 0:
+            old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
+            old_timeout = str(old_steps_key).replace('steps', '').strip()
+
+            fields = [
+                Field("desc", "Description", value=cfg.get('description', '')),
+                Field("timeout", "Timeout (seconds)", value=old_timeout),
+            ]
+            res = form_input(win, f"Edit metadata - {name}", fields)
+            if not res:
+                continue
+
+            cfg['description'] = res['desc'].strip()
+            timeout = res['timeout'].strip()
+            steps_key = f"steps {timeout}" if timeout else "steps"
+            try:
+                _parse_timeout(steps_key)
+            except ValueError:
+                status = "ERR: Timeout must be a positive integer"
+                continue
+
+            if steps_key != old_steps_key:
+                cfg[steps_key] = cfg.pop(old_steps_key)
+
+            sync_messages = save_cmd(name, cfg, cfg['_source'])
+            status = "OK: Metadata updated."
+            if _report_sync_messages(sync_messages, emit=False):
+                status = "WARN: Metadata saved with sync issues."
+
+        elif action == 1:
+            old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
+            existing_steps = cfg.get(old_steps_key, [])
+            steps = steps_editor(win, existing_steps)
+            if steps is not None:
+                cfg[old_steps_key] = steps
+                sync_messages = save_cmd(name, cfg, cfg['_source'])
+                status = "OK: Steps updated."
+                if _report_sync_messages(sync_messages, emit=False):
+                    status = "WARN: Steps saved with sync issues."
+
+        elif action == 2:
+            confirm = menu(win, f"Delete '{name}'?", ["Cancel", "Delete"])
+            if confirm == 1:
+                removed, sync_messages = remove_from_file(name, cfg['_source'])
+                if not removed:
+                    status = "ERR: Failed to remove command."
                     continue
 
-                cfg['description'] = res['desc'].strip()
-                timeout = res['timeout'].strip()
-                steps_key = f"steps {timeout}" if timeout else "steps"
-
-                if steps_key != old_steps_key:
-                    cfg[steps_key] = cfg.pop(old_steps_key)
-
-                save_cmd(name, cfg, cfg['_source'])
-
-            elif action == 1:
-                old_steps_key = next((k for k in cfg if str(k).startswith('steps')), 'steps')
-                existing_steps = cfg.get(old_steps_key, [])
-                steps = steps_editor(win, existing_steps)
-                if steps is not None:
-                    cfg[old_steps_key] = steps
-                    save_cmd(name, cfg, cfg['_source'])
-
-            elif action == 2:
-                confirm = menu(win, f"Delete '{name}'?", ["Cancel", "Delete"])
-                if confirm == 1:
-                    remove_from_file(name, cfg['_source'])
-                    del db[name]
-                    break
+                if _report_sync_messages(sync_messages, emit=False):
+                    return f"WARN: Removed '{name}' with sync issues."
+                return f"OK: Removed '{name}'."
 
 
 def _wizard_main(win):
     _init_colors()
-    curses.curs_set(0)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+
     win.keypad(True)
     win.timeout(-1)
 
+    status = ""
+    startup_sync_done = False
     while True:
         db = load_cmds(find_yamls())
-        choice = menu(win, "What would you like to do?", [
-            "Add command",
-            "Edit commands",
+        if not startup_sync_done:
+            auto_sync_messages = sync_binaries(db)
+            auto_sync_has_errors = _report_sync_messages(auto_sync_messages, emit=False)
+            auto_sync_has_warnings = any(msg.startswith("WARN: ") for msg in auto_sync_messages)
+
+            if not status:
+                if auto_sync_has_errors:
+                    status = "WARN: Automatic wrapper sync had errors."
+                elif auto_sync_has_warnings:
+                    status = "WARN: Some naked wrappers are disabled due to command conflicts."
+
+            startup_sync_done = True
+
+        command_names = sorted(db.keys())
+        if not command_names and not status:
+            status = "INFO: No commands yet. Add one to get started."
+
+        options = ["+ Add new command"]
+        if command_names:
+            options.extend(_menu_line_for_command(name, db[name]) for name in command_names)
+        options.extend([
+            "Refresh list",
+            "Exit",
         ])
 
-        if choice is None:
+        command_count = len(command_names)
+        first_command_idx = 1
+        refresh_idx = first_command_idx + command_count
+        exit_idx = refresh_idx + 1
+
+        choice = menu(win, "Command wrappers", options, status)
+        status = ""
+
+        if choice is None or choice == exit_idx:
             break
-        elif choice == 0:
-            _wizard_add(win)
-        elif choice == 1:
-            _wizard_edit(win, db)
+
+        if choice == 0:
+            if _wizard_add(win):
+                status = "OK: Command saved."
+            else:
+                status = "WARN: Add command canceled."
+            continue
+
+        if choice == refresh_idx:
+            status = "OK: Refreshed."
+            startup_sync_done = False
+            continue
+
+        if command_count == 0:
+            status = "INFO: No commands yet. Add one to get started."
+            continue
+
+        selected_idx = choice - first_command_idx
+        if selected_idx < 0 or selected_idx >= command_count:
+            continue
+
+        selected_name = command_names[selected_idx]
+        status = _wizard_edit_command(win, selected_name)
 
 
 
@@ -1353,7 +1544,7 @@ def cmd_add_yaml(yaml_str: str):
         _error("Input must be a YAML mapping.")
         sys.exit(1)
 
-    target = os.path.join(os.getcwd(), 'commands.yaml')
+    target = _preferred_command_file_for_write()
     for name, cfg in data.items():
         if not isinstance(cfg, dict):
             continue
@@ -1378,7 +1569,8 @@ def cmd_add_yaml(yaml_str: str):
             _error(f"skipping '{name}': {exc}")
             continue
 
-        save_cmd(normalized_name, cfg, target)
+        sync_messages = save_cmd(normalized_name, cfg, target)
+        _report_sync_messages(sync_messages)
         _ok(f"Added '{normalized_name}' to {target}")
 
 
@@ -1459,6 +1651,9 @@ def main():
     full_action = " ".join(action_parts)
 
     db = load_cmds(find_yamls())
+    if action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
+        _report_sync_messages(sync_binaries(db))
+
     if full_action in db:
         exec_cmd(full_action, db[full_action])
         return
@@ -1490,11 +1685,13 @@ def main():
 
     elif action == 'sync':
         is_uninstall = "--uninstall" in sys.argv
+        if not is_uninstall:
+            _warn("Manual sync is no longer required. Wrappers are synced automatically.")
         sync_errors = sync_binaries(db, uninstall=is_uninstall)
         if _report_sync_messages(sync_errors):
             sys.exit(1)
         if not is_uninstall:
-            _ok("Synced binary wrappers.")
+            _ok("Automatic wrapper sync complete.")
 
     elif action in ('configure', 'config'):
         run_wizard()
@@ -1517,7 +1714,9 @@ def main():
         if name not in db:
             _error(f"'{name}' not found")
             sys.exit(1)
-        if remove_from_file(name, db[name]['_source']):
+        removed, sync_messages = remove_from_file(name, db[name]['_source'])
+        _report_sync_messages(sync_messages)
+        if removed:
             _ok(f"Removed '{name}'.")
 
     else:
