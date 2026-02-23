@@ -53,8 +53,8 @@ The TUI opens directly into your command list for quick editing:
 - `Refresh list` and `Exit` are available in the same screen.
 
 Command definitions are discovered from:
-- Current working directory (`commands.yaml`, `commands.yml`, and local `.commands-wrapper/*.yml`)
-- User config directories (`$XDG_CONFIG_HOME/commands-wrapper` or `~/.config/commands-wrapper`, plus legacy `~/.commands-wrapper`)
+- Current working directory (`commands.yaml`, `commands.yml`, local `.commands-wrapper/*.{yml,yaml}`, and local `commands-wrapper/*.{yml,yaml}`)
+- User config directories (`%APPDATA%\commands-wrapper` on Windows, `$XDG_CONFIG_HOME/commands-wrapper` or `~/.config/commands-wrapper` on Linux/macOS, plus legacy `~/.commands-wrapper`)
 
 When command names overlap, local project definitions take precedence over user/global definitions.
 
@@ -84,12 +84,13 @@ system --update:
   description: "Quick system update"
   steps 60:
     - command: "sudo apt-get update && sudo apt-get upgrade -y"
-    - send: "<sudo-password>"
 ```
+
+Avoid storing secrets (passwords, tokens, keys) in command YAML files. Prefer interactive prompts or environment-based secrets.
 
 ## Commands
 
-> Tip: `cw` is an alias wrapper for `commands-wrapper`
+> Tip: `cw` is a generated wrapper command (shim) for `commands-wrapper`
 
 ### Configure
 
@@ -132,6 +133,8 @@ commands-wrapper skips that wrapper and prints a warning. Use:
 cw <command-name>
 commands-wrapper <command-name>
 ```
+
+Command matching is case-insensitive. Commands that differ only by case (for example `Foo` and `foo`) are rejected to avoid ambiguity.
 
 ### Update
 
