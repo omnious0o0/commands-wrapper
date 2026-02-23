@@ -791,6 +791,21 @@ def _resolve_command_name(
     return lookup_index.get(_command_lookup_key(requested))
 
 
+def _find_case_insensitive_conflict(
+    name: str,
+    candidates: List[str],
+    *,
+    ignore_name: Optional[str] = None,
+) -> Optional[str]:
+    target_key = _command_lookup_key(name)
+    for candidate in candidates:
+        if ignore_name is not None and candidate == ignore_name:
+            continue
+        if _command_lookup_key(candidate) == target_key:
+            return candidate
+    return None
+
+
 def _format_conflict_warning(wrapper_name: str, command_name: str) -> str:
     return (
         f"WARN: skipped naked wrapper '{wrapper_name}' for command '{command_name}' "
@@ -984,6 +999,17 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
         except (OSError, yaml.YAMLError):
             pass
 
+    all_commands = load_cmds(find_yamls())
+    lookup_index, lookup_errors = _build_command_lookup_index(all_commands)
+    if lookup_errors:
+        return lookup_errors
+
+    existing_name = lookup_index.get(_command_lookup_key(name))
+    if existing_name and existing_name != name:
+        return [
+            f"command name '{name}' conflicts with existing command '{existing_name}' under case-insensitive lookup"
+        ]
+
     parent = os.path.dirname(file_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -1026,6 +1052,19 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
 
     if old_name not in data:
         return False, f"'{old_name}' not found in source file", []
+
+    all_commands = load_cmds(find_yamls())
+    lookup_index, lookup_errors = _build_command_lookup_index(all_commands)
+    if lookup_errors:
+        return False, lookup_errors[0], []
+
+    existing_name = lookup_index.get(_command_lookup_key(new_name))
+    if existing_name and existing_name != old_name:
+        return (
+            False,
+            f"'{new_name}' conflicts with existing command '{existing_name}' under case-insensitive lookup",
+            [],
+        )
 
     if new_name != old_name and new_name in data:
         return False, f"'{new_name}' already exists in source file", []
@@ -1070,9 +1109,19 @@ def _wizard_add(win) -> bool:
             continue
 
         existing = load_cmds(find_yamls())
-        if name in existing:
+        conflict_name = _find_case_insensitive_conflict(name, list(existing.keys()))
+        if conflict_name:
             y = _draw_header(win, "Add command")
-            _addstr(win, y, 4, f"Command '{name}' already exists.", ERR())
+            if conflict_name == name:
+                _addstr(win, y, 4, f"Command '{name}' already exists.", ERR())
+            else:
+                _addstr(
+                    win,
+                    y,
+                    4,
+                    f"Command '{name}' conflicts with '{conflict_name}' under case-insensitive lookup.",
+                    ERR(),
+                )
             _addstr(win, y + 2, 4, "Use edit mode from the command list to update it.", DIM())
             _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
             win.refresh()
@@ -1099,11 +1148,12 @@ def _wizard_add(win) -> bool:
         sync_messages = save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
         if _report_sync_messages(sync_messages, emit=False):
             y = _draw_header(win, "Add command")
-            _addstr(win, y, 4, f"Saved to {target}", DIM())
-            _addstr(win, y + 2, 4, "Some wrappers could not be synced automatically. Check warnings in terminal output.", ERR())
+            _addstr(win, y, 4, "Failed to add command due validation or sync errors.", ERR())
+            _addstr(win, y + 2, 4, f"Target file: {target}", DIM())
             _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
             win.refresh()
             win.getch()
+            continue
         return True
 
 
@@ -1148,8 +1198,19 @@ def _wizard_edit_command(win, name: str) -> str:
                 status = "ERR: Invalid command name"
                 continue
 
-            if new_name != current_name and new_name in db:
-                status = f"ERR: Command '{new_name}' already exists"
+            conflict_name = _find_case_insensitive_conflict(
+                new_name,
+                list(db.keys()),
+                ignore_name=current_name,
+            )
+            if conflict_name:
+                if conflict_name == new_name:
+                    status = f"ERR: Command '{new_name}' already exists"
+                else:
+                    status = (
+                        f"ERR: Command '{new_name}' conflicts with '{conflict_name}' "
+                        "under case-insensitive lookup"
+                    )
                 continue
 
             renamed, err_message, sync_messages = rename_in_file(current_name, new_name, cfg['_source'])
@@ -1302,7 +1363,7 @@ def _run_basic_wizard() -> None:
 
 
 def _strip_add_yaml_flag(argv: List[str]) -> Tuple[List[str], bool]:
-    if len(argv) < 2 or argv[1] != 'add':
+    if len(argv) < 2 or argv[1].casefold() != 'add':
         return list(argv), False
 
     filtered = [argv[0]]
@@ -1733,22 +1794,29 @@ def cmd_add_yaml(yaml_str: str):
             _error(message)
         sys.exit(1)
 
+    had_errors = False
+    added_count = 0
+
     for name, cfg in data.items():
         if not isinstance(cfg, dict):
+            had_errors = True
             continue
 
         normalized_name = str(name).strip()
         if not _is_valid_name(normalized_name):
             _error(f"skipping '{name}': invalid command name")
+            had_errors = True
             continue
 
         steps_key = _get_steps_key(cfg)
         if not steps_key:
             _error(f"skipping '{name}': no steps key found")
+            had_errors = True
             continue
 
         if not isinstance(cfg.get(steps_key), list):
             _error(f"skipping '{name}': steps value must be a list")
+            had_errors = True
             continue
 
         lookup_key = _command_lookup_key(normalized_name)
@@ -1757,19 +1825,33 @@ def cmd_add_yaml(yaml_str: str):
             _error(
                 f"skipping '{name}': conflicts with existing command '{existing_name}' under case-insensitive lookup"
             )
+            had_errors = True
             continue
 
         try:
             _parse_timeout(steps_key)
         except ValueError as exc:
             _error(f"skipping '{name}': {exc}")
+            had_errors = True
             continue
 
         sync_messages = save_cmd(normalized_name, cfg, target)
+        has_sync_errors = _report_sync_messages(sync_messages)
+        if has_sync_errors:
+            had_errors = True
+            continue
+
         existing_commands[normalized_name] = cfg
         lookup_index[lookup_key] = normalized_name
-        _report_sync_messages(sync_messages)
+        added_count += 1
         _ok(f"Added '{normalized_name}' to {target}")
+
+    if added_count == 0:
+        _error("No valid commands were added.")
+        sys.exit(1)
+
+    if had_errors:
+        sys.exit(1)
 
 
 def _pip_install():

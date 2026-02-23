@@ -49,6 +49,13 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(argv, ["commands-wrapper", "add", "my-cmd"])
         self.assertTrue(has_yaml)
 
+    def test_strip_add_yaml_flag_for_uppercase_add(self):
+        argv, has_yaml = cw._strip_add_yaml_flag(
+            ["commands-wrapper", "ADD", "--yaml", "my-cmd"]
+        )
+        self.assertEqual(argv, ["commands-wrapper", "ADD", "my-cmd"])
+        self.assertTrue(has_yaml)
+
     def test_conflict_warning_avoids_leaking_absolute_paths(self):
         db = {
             "extract": {
@@ -172,6 +179,129 @@ class CommandsWrapperTests(unittest.TestCase):
             cw.main()
 
         exec_mock.assert_called_once_with("claw upd", db["claw upd"])
+
+    def test_save_cmd_rejects_case_insensitive_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'OAA:\n  description: uppercase\n  steps:\n    - command: "echo hi"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    messages = cw.save_cmd(
+                        "oaa",
+                        {
+                            "description": "lowercase",
+                            "steps": [{"command": "echo conflict"}],
+                        },
+                        str(commands_file),
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertTrue(messages)
+            self.assertIn("conflicts with existing command", messages[0])
+
+    def test_cmd_add_yaml_exits_nonzero_on_case_insensitive_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'Foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False), self.assertRaises(
+                    SystemExit
+                ) as exc, mock.patch.object(cw, "_error") as error_mock:
+                    cw.cmd_add_yaml(
+                        "foo:\n"
+                        "  description: conflict\n"
+                        "  steps:\n"
+                        '    - command: "echo two"\n'
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertGreaterEqual(error_mock.call_count, 1)
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("Foo:", content)
+            self.assertNotIn("foo:\n", content)
+
+    def test_rename_in_file_rejects_case_insensitive_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                "Foo:\n"
+                "  description: first\n"
+                "  steps:\n"
+                '    - command: "echo foo"\n'
+                "Bar:\n"
+                "  description: second\n"
+                "  steps:\n"
+                '    - command: "echo bar"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    renamed, err_message, sync_messages = cw.rename_in_file(
+                        "Bar", "foo", str(commands_file)
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertFalse(renamed)
+            self.assertIn("conflicts with existing command", err_message)
+            self.assertEqual(sync_messages, [])
 
     def test_main_list_uses_non_conflict_sync_path(self):
         with mock.patch.object(cw, "load_cmds", return_value={}), mock.patch.object(
@@ -302,6 +432,15 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$pyExitCode -eq 0", content)
         self.assertIn("$pythonExitCode -eq 0", content)
         self.assertIn("$LASTEXITCODE -ne 0", content)
+
+    def test_uninstall_ps1_includes_exit_code_guards(self):
+        uninstall_ps1 = SCRIPT_PATH.parent / "uninstall.ps1"
+        content = uninstall_ps1.read_text(encoding="utf-8")
+
+        self.assertIn("$pyExitCode -eq 0", content)
+        self.assertIn("$pythonExitCode -eq 0", content)
+        self.assertIn("$LASTEXITCODE -ne 0", content)
+        self.assertIn("$syncWarning", content)
 
     @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
     def test_install_ps1_falls_back_from_py_to_python(self):
