@@ -803,6 +803,31 @@ def _wrapper_name_from_command_name(command_name: str) -> Optional[str]:
     return wrapper_name
 
 
+def _wrapper_alias_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    wrapper_alias = "-".join(normalized.split())
+    if not wrapper_alias:
+        return None
+
+    canonical = _wrapper_name_from_command_name(command_name)
+    if not canonical:
+        return None
+
+    if wrapper_alias == canonical:
+        return None
+
+    if not all(c.isalnum() or c in '-_' for c in wrapper_alias):
+        return None
+
+    if wrapper_alias.casefold() in (SHORT_ALIAS.casefold(), LEGACY_ALIAS.casefold()):
+        return None
+
+    return wrapper_alias
+
+
 def _command_lookup_key(name: Any) -> str:
     return str(name).strip().casefold()
 
@@ -874,14 +899,20 @@ def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
         if not wrapper_name:
             continue
 
-        previous = wrappers.get(wrapper_name)
-        if previous and previous != command_name:
-            errors.append(
-                f"wrapper name collision for '{wrapper_name}': '{previous}' vs '{command_name}'"
-            )
-            continue
+        wrapper_names = [wrapper_name]
+        wrapper_alias = _wrapper_alias_from_command_name(command_name)
+        if wrapper_alias and wrapper_alias not in wrapper_names:
+            wrapper_names.append(wrapper_alias)
 
-        wrappers[wrapper_name] = command_name
+        for candidate in wrapper_names:
+            previous = wrappers.get(candidate)
+            if previous and previous != command_name:
+                errors.append(
+                    f"wrapper name collision for '{candidate}': '{previous}' vs '{command_name}'"
+                )
+                continue
+
+            wrappers[candidate] = command_name
 
     return wrappers, errors
 

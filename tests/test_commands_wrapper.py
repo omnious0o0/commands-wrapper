@@ -237,8 +237,50 @@ class CommandsWrapperTests(unittest.TestCase):
             expected_target = cw.shlex.quote(os.path.realpath(str(module_path)))
             self.assertIn(f'exec {expected_target} "$@"', content)
 
+    def test_sync_binaries_writes_original_case_wrapper_alias(self):
+        db = {
+            "OAA": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                messages = cw.sync_binaries(
+                    db,
+                    bin_dir=str(target_bin),
+                    platform_name="posix",
+                    report_conflicts=False,
+                )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            self.assertTrue((target_bin / "oaa").is_file())
+            self.assertTrue((target_bin / "OAA").is_file())
+
     def test_wrapper_name_from_command_name_normalizes_case(self):
         self.assertEqual(cw._wrapper_name_from_command_name("My Cmd"), "my-cmd")
+
+    def test_wrapper_alias_from_command_name_preserves_case(self):
+        self.assertEqual(cw._wrapper_alias_from_command_name("OAA"), "OAA")
+        self.assertIsNone(cw._wrapper_alias_from_command_name("oaa"))
+
+    def test_build_wrapper_map_adds_case_alias_wrapper(self):
+        wrappers, errors = cw._build_wrapper_map(
+            {
+                "OAA": {
+                    "description": "demo",
+                    "steps": [{"command": "echo hi"}],
+                }
+            }
+        )
+
+        self.assertFalse(errors)
+        self.assertEqual(wrappers.get("oaa"), "OAA")
+        self.assertEqual(wrappers.get("OAA"), "OAA")
 
     def test_build_command_lookup_index_detects_case_collisions(self):
         index, errors = cw._build_command_lookup_index({"OAA": {}, "oaa": {}})

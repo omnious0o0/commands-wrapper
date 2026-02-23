@@ -150,6 +150,7 @@ commands-wrapper <command-name>
 ```
 
 Command matching is case-insensitive. Commands that differ only by case (for example `Foo` and `foo`) are rejected to avoid ambiguity.
+For naked wrappers on case-sensitive filesystems, commands that contain uppercase letters also generate a preserved-case alias wrapper (for example both `oaa` and `OAA`).
 
 ### Update
 
