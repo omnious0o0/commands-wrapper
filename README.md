@@ -54,6 +54,11 @@ command-name:
     - wait: "time to wait"
 ```
 
+`cd` commands are handled specially:
+- `- command: "cd /some/path"` updates the working directory for following steps.
+- If a wrapper contains only a single `cd` step and runs in an interactive terminal,
+  commands-wrapper opens a shell in that directory.
+
 Example:
 
 ```yaml

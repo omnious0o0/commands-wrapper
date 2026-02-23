@@ -800,6 +800,76 @@ def _run_pip(args: List[str], cwd: Optional[str] = None, suppress_output: bool =
     return fallback.returncode
 
 
+def _extract_cd_target(command: Any) -> Optional[str]:
+    if not isinstance(command, str):
+        return None
+
+    try:
+        parts = shlex.split(command, posix=(os.name != 'nt'))
+    except ValueError:
+        return None
+
+    if not parts or parts[0] != 'cd':
+        return None
+
+    if len(parts) == 1:
+        return '~'
+
+    if len(parts) == 2:
+        return parts[1]
+
+    return None
+
+
+def _resolve_cd_target(target: str) -> str:
+    if target == '-':
+        previous = os.environ.get('OLDPWD')
+        if not previous:
+            raise ValueError("OLDPWD is not set for 'cd -'.")
+        target = previous
+
+    expanded = os.path.expandvars(os.path.expanduser(target))
+    if not os.path.isabs(expanded):
+        expanded = os.path.abspath(os.path.join(os.getcwd(), expanded))
+    return expanded
+
+
+def _change_directory(target: str) -> None:
+    destination = _resolve_cd_target(target)
+    if not os.path.isdir(destination):
+        raise ValueError(f"directory does not exist: {destination}")
+
+    previous = os.getcwd()
+    try:
+        os.chdir(destination)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ValueError(f"unable to cd into '{target}': {reason}") from exc
+
+    os.environ['OLDPWD'] = previous
+    os.environ['PWD'] = os.getcwd()
+
+
+def _is_single_cd_step(steps: List[Dict[str, Any]]) -> bool:
+    if len(steps) != 1:
+        return False
+    step = steps[0]
+    if not isinstance(step, dict):
+        return False
+    return _extract_cd_target(step.get('command')) is not None
+
+
+def _open_interactive_shell() -> None:
+    shell = _shell_name()
+    args = [shell]
+    if os.name != 'nt':
+        args.append('-i')
+    try:
+        subprocess.run(args, cwd=os.getcwd(), check=False)
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise ValueError(f"unable to open interactive shell: {reason}") from exc
+
 
 class StepTimeoutError(RuntimeError):
     """Raised when a command step exceeds its timeout."""
@@ -938,14 +1008,21 @@ def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
 
 def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optional[int]):
     if 'command' in ctx:
+        command_text = str(ctx['command'])
+        cd_target = _extract_cd_target(command_text)
+
         if proc and proc.isalive():
             try:
                 proc.interact()
             finally:
                 proc.close()
 
-        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{ctx['command']}")
-        return _spawn_process(str(ctx['command']), timeout)
+        if cd_target is not None:
+            _change_directory(cd_target)
+            return None
+
+        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{command_text}")
+        return _spawn_process(command_text, timeout)
 
     if 'send' in ctx:
         if not proc:
@@ -1000,6 +1077,8 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
         _error(f"'{name}' has no steps to execute.")
         sys.exit(1)
 
+    single_cd_step = _is_single_cd_step(steps)
+
     proc = None
     try:
         for s in steps:
@@ -1021,6 +1100,12 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
             sys.exit(1)
         finally:
             proc.close()
+    elif single_cd_step and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            _open_interactive_shell()
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
 
 
 def print_list(db: Dict):
