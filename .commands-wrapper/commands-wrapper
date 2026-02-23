@@ -190,7 +190,11 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
     focus = 0
     form_scroll = 0
 
-    prev_cursor = curses.curs_set(1)
+    prev_cursor: Optional[int] = None
+    try:
+        prev_cursor = curses.curs_set(1)
+    except curses.error:
+        prev_cursor = None
     try:
         while True:
             h, w = win.getmaxyx()
@@ -245,6 +249,25 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
                             pad.addch(f.top_y + 1 + r, 5, "<", DIM())
                         if len(f.lines[ridx]) > f.view_x + fw:
                             pad.addch(f.top_y + 1 + r, 6 + fw, ">", DIM())
+
+                if is_active:
+                    cursor_row = f.cur_y - f.view_y
+                    cursor_col = f.cur_x - f.view_x
+                    if 0 <= cursor_row < fh and 0 <= cursor_col < fw:
+                        cursor_char = " "
+                        if f.cur_y < len(f.lines):
+                            line_chars = f.lines[f.cur_y]
+                            if f.cur_x < len(line_chars):
+                                cursor_char = line_chars[f.cur_x]
+                        try:
+                            pad.addch(
+                                f.top_y + 1 + cursor_row,
+                                6 + cursor_col,
+                                cursor_char,
+                                curses.A_REVERSE | curses.A_BOLD,
+                            )
+                        except curses.error:
+                            pass
 
                 if not focus_mode:
                     py += box_h + 1
@@ -361,7 +384,11 @@ def form_input(win, title: str, fields: List[Field]) -> Optional[Dict[str, str]]
                 f.lines[f.cur_y].insert(f.cur_x, chr(key))
                 f.cur_x += 1
     finally:
-        curses.curs_set(prev_cursor)
+        if prev_cursor is not None:
+            try:
+                curses.curs_set(prev_cursor)
+            except curses.error:
+                pass
 
 
 def _step_label(s: Dict) -> str:
