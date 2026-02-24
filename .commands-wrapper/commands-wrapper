@@ -24,11 +24,28 @@ try:
 except Exception:  # pragma: no cover - platform dependent
     _pexpect = None
 
+try:
+    import termios as _termios
+except Exception:  # pragma: no cover - platform dependent
+    _termios = None
+
 CURSES_AVAILABLE = _curses is not None
 PEXPECT_AVAILABLE = _pexpect is not None
 
 curses: Any = _curses
 pexpect: Any = _pexpect
+
+NON_INTERACTIVE_INTERACT_EXCEPTIONS: Tuple[type, ...] = (OSError, ValueError)
+if PEXPECT_AVAILABLE:
+    NON_INTERACTIVE_INTERACT_EXCEPTIONS = (
+        *NON_INTERACTIVE_INTERACT_EXCEPTIONS,
+        pexpect.EOF,
+    )
+if _termios is not None:
+    NON_INTERACTIVE_INTERACT_EXCEPTIONS = (
+        *NON_INTERACTIVE_INTERACT_EXCEPTIONS,
+        _termios.error,
+    )
 
 ANSI_PRIMARY = "\033[38;5;67m"
 ANSI_MUTED = "\033[38;5;244m"
@@ -834,6 +851,18 @@ def _wrapper_alias_from_command_name(command_name: str) -> Optional[str]:
     return wrapper_alias
 
 
+def _namespace_prefix_from_command_name(command_name: str) -> Optional[str]:
+    normalized = str(command_name).strip()
+    if not normalized:
+        return None
+
+    parts = normalized.split()
+    if len(parts) < 2:
+        return None
+
+    return parts[0]
+
+
 def _command_lookup_key(name: Any) -> str:
     return str(name).strip().casefold()
 
@@ -905,20 +934,37 @@ def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
         if not wrapper_name:
             continue
 
-        wrapper_names = [wrapper_name]
-        wrapper_alias = _wrapper_alias_from_command_name(command_name)
-        if wrapper_alias and wrapper_alias not in wrapper_names:
-            wrapper_names.append(wrapper_alias)
+        wrapper_targets: List[Tuple[str, str]] = [(wrapper_name, command_name)]
 
-        for candidate in wrapper_names:
+        wrapper_alias = _wrapper_alias_from_command_name(command_name)
+        if wrapper_alias:
+            wrapper_targets.append((wrapper_alias, command_name))
+
+        namespace_prefix = _namespace_prefix_from_command_name(command_name)
+        if namespace_prefix:
+            namespace_wrapper = _wrapper_name_from_command_name(namespace_prefix)
+            if namespace_wrapper:
+                wrapper_targets.append((namespace_wrapper, namespace_prefix))
+
+            namespace_alias = _wrapper_alias_from_command_name(namespace_prefix)
+            if namespace_alias:
+                wrapper_targets.append((namespace_alias, namespace_prefix))
+
+        seen_targets: Dict[str, str] = {}
+        for candidate, target_command in wrapper_targets:
+            if candidate in seen_targets:
+                continue
+            seen_targets[candidate] = target_command
+
+        for candidate, target_command in seen_targets.items():
             previous = wrappers.get(candidate)
-            if previous and previous != command_name:
+            if previous and previous != target_command:
                 errors.append(
-                    f"wrapper name collision for '{candidate}': '{previous}' vs '{command_name}'"
+                    f"wrapper name collision for '{candidate}': '{previous}' vs '{target_command}'"
                 )
                 continue
 
-            wrappers[candidate] = command_name
+            wrappers[candidate] = target_command
 
     return wrappers, errors
 
@@ -960,10 +1006,14 @@ def _wrapper_conflict_warnings_for_command(
         report_conflicts=False,
     )
 
+    target_keys = {_command_lookup_key(command_name)}
+    namespace_prefix = _namespace_prefix_from_command_name(command_name)
+    if namespace_prefix:
+        target_keys.add(_command_lookup_key(namespace_prefix))
+
     warnings: List[str] = []
-    target_key = _command_lookup_key(command_name)
     for wrapper_name, blocked_command in blocked.items():
-        if _command_lookup_key(blocked_command) != target_key:
+        if _command_lookup_key(blocked_command) not in target_keys:
             continue
         warnings.append(_format_conflict_warning(wrapper_name, blocked_command))
 
@@ -1710,7 +1760,7 @@ class PExpectProcessAdapter(ProcessAdapter):
             return
         except pexpect.TIMEOUT as exc:
             raise StepTimeoutError from exc
-        except (pexpect.EOF, OSError, ValueError):
+        except NON_INTERACTIVE_INTERACT_EXCEPTIONS:
             # Non-interactive shells (CI, pipes) cannot attach a TTY.
             pass
 

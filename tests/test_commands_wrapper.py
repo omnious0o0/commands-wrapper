@@ -296,6 +296,33 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue((target_bin / "oaa").is_file())
             self.assertTrue((target_bin / "OAA").is_file())
 
+    def test_sync_binaries_writes_namespace_wrapper_for_multi_word_command(self):
+        db = {
+            "claw doc": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                messages = cw.sync_binaries(
+                    db,
+                    bin_dir=str(target_bin),
+                    platform_name="posix",
+                    report_conflicts=False,
+                )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            self.assertTrue((target_bin / "claw-doc").is_file())
+            namespace_wrapper = target_bin / "claw"
+            self.assertTrue(namespace_wrapper.is_file())
+            namespace_content = namespace_wrapper.read_text(encoding="utf-8")
+            self.assertIn(' claw "$@"', namespace_content)
+
     def test_wrapper_name_from_command_name_normalizes_case(self):
         self.assertEqual(cw._wrapper_name_from_command_name("My Cmd"), "my-cmd")
 
@@ -316,6 +343,20 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(wrappers.get("oaa"), "OAA")
         self.assertEqual(wrappers.get("OAA"), "OAA")
+
+    def test_build_wrapper_map_adds_namespace_wrapper_for_multi_word_command(self):
+        wrappers, errors = cw._build_wrapper_map(
+            {
+                "claw doc": {
+                    "description": "demo",
+                    "steps": [{"command": "echo hi"}],
+                }
+            }
+        )
+
+        self.assertFalse(errors)
+        self.assertEqual(wrappers.get("claw-doc"), "claw doc")
+        self.assertEqual(wrappers.get("claw"), "claw")
 
     def test_build_command_lookup_index_detects_case_collisions(self):
         index, errors = cw._build_command_lookup_index({"OAA": {}, "oaa": {}})
@@ -477,6 +518,22 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIs(returned, proc)
         self.assertEqual(proc.calls, [("sendline", "")])
+
+    @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
+    @unittest.skipIf(getattr(cw, "_termios", None) is None, "termios unavailable")
+    def test_pexpect_adapter_interact_handles_termios_error(self):
+        class DummyProc:
+            timeout = 1
+
+            def interact(self):
+                raise cw._termios.error(25, "Inappropriate ioctl for device")
+
+            def expect(self, _pattern, timeout=None):
+                return 0
+
+        adapter = cw.PExpectProcessAdapter.__new__(cw.PExpectProcessAdapter)
+        adapter._proc = DummyProc()
+        adapter.interact()
 
     def test_find_source_cli_for_build_artifact_resolves_project_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -895,6 +952,41 @@ class CommandsWrapperTests(unittest.TestCase):
         exec_mock.assert_called_once_with("cc", db["cc"])
         warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
         self.assertTrue(any("'cc'" in text for text in warning_texts))
+        self.assertFalse(any("'extract'" in text for text in warning_texts))
+
+    def test_main_multi_word_command_reports_namespace_conflict_only(self):
+        db = {
+            "claw doc": {
+                "description": "demo",
+                "steps": [{"command": "echo claw"}],
+            },
+            "extract": {
+                "description": "demo",
+                "steps": [{"command": "echo extract"}],
+            },
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(
+                cw,
+                "_build_wrapper_map_with_conflicts",
+                return_value=(
+                    {"cw": "cw"},
+                    [],
+                    {"claw": "claw", "extract": "extract"},
+                ),
+            ),
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "claw", "doc"]),
+        ):
+            cw.main()
+
+        exec_mock.assert_called_once_with("claw doc", db["claw doc"])
+        warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
+        self.assertTrue(any("'claw'" in text for text in warning_texts))
         self.assertFalse(any("'extract'" in text for text in warning_texts))
 
     def test_main_sync_uninstall_is_not_shadowed_by_user_command(self):
