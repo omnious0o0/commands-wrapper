@@ -63,6 +63,7 @@ LEGACY_ALIAS = "command-wrapper"
 DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
 DEFAULT_UPDATE_DOWNLOAD_TIMEOUT = 30
+ESC_KEY_DELAY_MS = 25
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -143,6 +144,17 @@ def _has_tui_support() -> bool:
 
 def _cmd_quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _configure_escape_key_delay() -> None:
+    set_escdelay = getattr(curses, 'set_escdelay', None)
+    if not callable(set_escdelay):
+        return
+
+    try:
+        set_escdelay(ESC_KEY_DELAY_MS)
+    except curses.error:
+        pass
 
 
 def _init_colors():
@@ -1547,6 +1559,7 @@ def _wizard_edit_command(win, name: str) -> str:
 
 
 def _wizard_main(win):
+    _configure_escape_key_delay()
     _init_colors()
     try:
         curses.curs_set(0)
@@ -1822,7 +1835,6 @@ class PExpectProcessAdapter(ProcessAdapter):
             timeout=timeout,
         )
         self._log_sink = _PExpectLogSink(sys.stdout)
-        self._proc.logfile_read = self._log_sink
 
     def isalive(self) -> bool:
         return self._proc.isalive()
@@ -1837,10 +1849,14 @@ class PExpectProcessAdapter(ProcessAdapter):
             # Non-interactive shells (CI, pipes) cannot attach a TTY.
             pass
 
+        previous_logfile_read = getattr(self._proc, 'logfile_read', None)
+        self._proc.logfile_read = self._log_sink
         try:
             self._proc.expect(pexpect.EOF, timeout=self._proc.timeout)
         except pexpect.TIMEOUT as exc:
             raise StepTimeoutError from exc
+        finally:
+            self._proc.logfile_read = previous_logfile_read
 
     def close(self) -> None:
         self._proc.close()
@@ -2346,12 +2362,6 @@ def main():
 
     if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
         _report_sync_messages(sync_binaries(db, report_conflicts=False))
-
-        command_for_conflict_warning = resolved_full_action or resolved_action
-        if command_for_conflict_warning:
-            _report_sync_messages(
-                _wrapper_conflict_warnings_for_command(db, command_for_conflict_warning)
-            )
 
     if normalized_action == 'sync':
         is_uninstall = "--uninstall" in sys.argv

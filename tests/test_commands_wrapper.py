@@ -153,6 +153,32 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertTrue(keep_open)
         self.assertEqual(fields[0].get_value(), "a\nb")
 
+    def test_configure_escape_key_delay_sets_low_delay(self):
+        class FakeCurses:
+            error = RuntimeError
+
+            def __init__(self):
+                self.values = []
+
+            def set_escdelay(self, value):
+                self.values.append(value)
+
+        fake_curses = FakeCurses()
+        with mock.patch.object(cw, "curses", fake_curses):
+            cw._configure_escape_key_delay()
+
+        self.assertEqual(fake_curses.values, [cw.ESC_KEY_DELAY_MS])
+
+    def test_configure_escape_key_delay_ignores_curses_error(self):
+        class FakeCurses:
+            error = RuntimeError
+
+            def set_escdelay(self, _value):
+                raise RuntimeError("unsupported")
+
+        with mock.patch.object(cw, "curses", FakeCurses()):
+            cw._configure_escape_key_delay()
+
     def test_strip_add_yaml_flag_is_scoped_to_add(self):
         argv, has_yaml = cw._strip_add_yaml_flag(["commands-wrapper", "list", "--yaml"])
         self.assertEqual(argv, ["commands-wrapper", "list", "--yaml"])
@@ -560,7 +586,7 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(stream.getvalue(), "hello world")
 
     @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
-    def test_pexpect_adapter_uses_safe_log_sink(self):
+    def test_pexpect_adapter_detaches_logfile_read_by_default(self):
         class DummySpawn:
             def __init__(self):
                 self.logfile_read = None
@@ -576,7 +602,8 @@ class CommandsWrapperTests(unittest.TestCase):
             adapter = cw.PExpectProcessAdapter("echo hi", timeout=None)
 
         self.assertIs(adapter._proc, dummy_spawn)
-        self.assertIsInstance(dummy_spawn.logfile_read, cw._PExpectLogSink)
+        self.assertIsInstance(adapter._log_sink, cw._PExpectLogSink)
+        self.assertIsNone(dummy_spawn.logfile_read)
         spawn_mock.assert_called_once_with(
             "/bin/sh",
             ["-c", "echo hi"],
@@ -584,6 +611,31 @@ class CommandsWrapperTests(unittest.TestCase):
             codec_errors="replace",
             timeout=None,
         )
+
+    @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
+    def test_pexpect_adapter_non_interactive_fallback_streams_once(self):
+        class DummyProc:
+            timeout = 1
+
+            def __init__(self):
+                self.logfile_read = None
+                self.expect_logfile_read = None
+
+            def interact(self):
+                raise OSError("non-interactive")
+
+            def expect(self, _pattern, timeout=None):
+                self.expect_logfile_read = self.logfile_read
+                return 0
+
+        adapter = cw.PExpectProcessAdapter.__new__(cw.PExpectProcessAdapter)
+        adapter._proc = DummyProc()
+        adapter._log_sink = object()
+
+        adapter.interact()
+
+        self.assertIs(adapter._proc.expect_logfile_read, adapter._log_sink)
+        self.assertIsNone(adapter._proc.logfile_read)
 
     @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
     @unittest.skipIf(getattr(cw, "_termios", None) is None, "termios unavailable")
@@ -599,6 +651,7 @@ class CommandsWrapperTests(unittest.TestCase):
 
         adapter = cw.PExpectProcessAdapter.__new__(cw.PExpectProcessAdapter)
         adapter._proc = DummyProc()
+        adapter._log_sink = object()
         adapter.interact()
 
     def test_find_source_cli_for_build_artifact_resolves_project_source(self):
@@ -1050,7 +1103,7 @@ class CommandsWrapperTests(unittest.TestCase):
         sync_mock.assert_called_once_with({}, report_conflicts=False)
         list_mock.assert_called_once_with({})
 
-    def test_main_command_conflict_warning_only_mentions_target_command(self):
+    def test_main_command_execution_suppresses_wrapper_conflict_warnings(self):
         db = {
             "cc": {
                 "description": "demo",
@@ -1066,24 +1119,13 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(cw, "load_cmds", return_value=db),
             mock.patch.object(cw, "sync_binaries", return_value=[]),
             mock.patch.object(cw, "exec_cmd") as exec_mock,
-            mock.patch.object(
-                cw,
-                "_build_wrapper_map_with_conflicts",
-                return_value=(
-                    {"cw": "cw"},
-                    [],
-                    {"cc": "cc", "extract": "extract"},
-                ),
-            ),
             mock.patch.object(cw, "_warn") as warn_mock,
             mock.patch.object(sys, "argv", ["commands-wrapper", "cc"]),
         ):
             cw.main()
 
         exec_mock.assert_called_once_with("cc", db["cc"])
-        warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
-        self.assertTrue(any("'cc'" in text for text in warning_texts))
-        self.assertFalse(any("'extract'" in text for text in warning_texts))
+        warn_mock.assert_not_called()
 
     def test_wrapper_conflict_warnings_for_command_filters_unrelated_collisions(self):
         db = {
@@ -1115,7 +1157,7 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertTrue(any("'cc'" in message for message in warnings))
         self.assertFalse(any("collision" in message for message in warnings))
 
-    def test_main_multi_word_command_reports_namespace_conflict_only(self):
+    def test_main_multi_word_command_suppresses_namespace_conflict_warning(self):
         db = {
             "claw doc": {
                 "description": "demo",
@@ -1131,24 +1173,13 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(cw, "load_cmds", return_value=db),
             mock.patch.object(cw, "sync_binaries", return_value=[]),
             mock.patch.object(cw, "exec_cmd") as exec_mock,
-            mock.patch.object(
-                cw,
-                "_build_wrapper_map_with_conflicts",
-                return_value=(
-                    {"cw": "cw"},
-                    [],
-                    {"claw": "claw", "extract": "extract"},
-                ),
-            ),
             mock.patch.object(cw, "_warn") as warn_mock,
             mock.patch.object(sys, "argv", ["commands-wrapper", "claw", "doc"]),
         ):
             cw.main()
 
         exec_mock.assert_called_once_with("claw doc", db["claw doc"])
-        warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
-        self.assertTrue(any("'claw'" in text for text in warning_texts))
-        self.assertFalse(any("'extract'" in text for text in warning_texts))
+        warn_mock.assert_not_called()
 
     def test_sync_binaries_uninstall_does_not_create_missing_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
