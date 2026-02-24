@@ -859,8 +859,43 @@ class CommandsWrapperTests(unittest.TestCase):
         ):
             cw.main()
 
-        sync_mock.assert_called_once_with({}, report_conflicts=True)
+        sync_mock.assert_called_once_with({}, report_conflicts=False)
         list_mock.assert_called_once_with({})
+
+    def test_main_command_conflict_warning_only_mentions_target_command(self):
+        db = {
+            "cc": {
+                "description": "demo",
+                "steps": [{"command": "echo cc"}],
+            },
+            "extract": {
+                "description": "demo",
+                "steps": [{"command": "echo extract"}],
+            },
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(
+                cw,
+                "_build_wrapper_map_with_conflicts",
+                return_value=(
+                    {"cw": "cw"},
+                    [],
+                    {"cc": "cc", "extract": "extract"},
+                ),
+            ),
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "cc"]),
+        ):
+            cw.main()
+
+        exec_mock.assert_called_once_with("cc", db["cc"])
+        warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
+        self.assertTrue(any("'cc'" in text for text in warning_texts))
+        self.assertFalse(any("'extract'" in text for text in warning_texts))
 
     def test_main_sync_uninstall_is_not_shadowed_by_user_command(self):
         db = {

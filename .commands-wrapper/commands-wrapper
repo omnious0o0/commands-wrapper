@@ -948,6 +948,28 @@ def _build_wrapper_map_with_conflicts(
     return filtered, errors, blocked
 
 
+def _wrapper_conflict_warnings_for_command(
+    db: Dict[str, Any],
+    command_name: str,
+    target_dir: Optional[str] = None,
+) -> List[str]:
+    destination = target_dir or _script_bin_dir(os.name)
+    _, errors, blocked = _build_wrapper_map_with_conflicts(
+        db,
+        destination,
+        report_conflicts=False,
+    )
+
+    warnings: List[str] = []
+    target_key = _command_lookup_key(command_name)
+    for wrapper_name, blocked_command in blocked.items():
+        if _command_lookup_key(blocked_command) != target_key:
+            continue
+        warnings.append(_format_conflict_warning(wrapper_name, blocked_command))
+
+    return [*errors, *warnings]
+
+
 
 def sync_binaries(
     db: Dict[str, Any],
@@ -2193,8 +2215,17 @@ def main():
             _error(message)
         sys.exit(1)
 
+    resolved_full_action = _resolve_command_name(full_action, db, lookup_index)
+    resolved_action = _resolve_command_name(action, db, lookup_index)
+
     if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
-        _report_sync_messages(sync_binaries(db, report_conflicts=True))
+        _report_sync_messages(sync_binaries(db, report_conflicts=False))
+
+        command_for_conflict_warning = resolved_full_action or resolved_action
+        if command_for_conflict_warning:
+            _report_sync_messages(
+                _wrapper_conflict_warnings_for_command(db, command_for_conflict_warning)
+            )
 
     if normalized_action == 'sync':
         is_uninstall = "--uninstall" in sys.argv
@@ -2207,7 +2238,6 @@ def main():
             _ok("Automatic wrapper sync complete.")
         return
 
-    resolved_full_action = _resolve_command_name(full_action, db, lookup_index)
     if resolved_full_action:
         exec_cmd(resolved_full_action, db[resolved_full_action])
         return
@@ -2274,9 +2304,7 @@ def main():
         _ok(f"Removed '{resolved_name}'.")
 
     else:
-        target = _resolve_command_name(full_action, db, lookup_index)
-        if not target:
-            target = _resolve_command_name(action, db, lookup_index)
+        target = resolved_full_action or resolved_action
         if target:
             exec_cmd(target, db[target])
         else:
