@@ -62,6 +62,7 @@ LEGACY_ALIAS = "command-wrapper"
 
 DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
+DEFAULT_UPDATE_DOWNLOAD_TIMEOUT = 30
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -820,7 +821,11 @@ def _wrapper_name_from_command_name(command_name: str) -> Optional[str]:
     if not all(c.isalnum() or c in '-_' for c in wrapper_name):
         return None
 
-    if wrapper_name in (SHORT_ALIAS.casefold(), LEGACY_ALIAS.casefold()):
+    if wrapper_name in (
+        SHORT_ALIAS.casefold(),
+        LEGACY_ALIAS.casefold(),
+        PRIMARY_WRAPPER.casefold(),
+    ):
         return None
 
     return wrapper_name
@@ -845,7 +850,11 @@ def _wrapper_alias_from_command_name(command_name: str) -> Optional[str]:
     if not all(c.isalnum() or c in '-_' for c in wrapper_alias):
         return None
 
-    if wrapper_alias.casefold() in (SHORT_ALIAS.casefold(), LEGACY_ALIAS.casefold()):
+    if wrapper_alias.casefold() in (
+        SHORT_ALIAS.casefold(),
+        LEGACY_ALIAS.casefold(),
+        PRIMARY_WRAPPER.casefold(),
+    ):
         return None
 
     return wrapper_alias
@@ -994,6 +1003,18 @@ def _build_wrapper_map_with_conflicts(
     return filtered, errors, blocked
 
 
+def _is_relevant_wrapper_collision_error(message: str, target_keys: set[str]) -> bool:
+    if not message.startswith("wrapper name collision for '"):
+        return False
+
+    parts = message.split("'")
+    if len(parts) < 6:
+        return False
+
+    candidates = (parts[3], parts[5])
+    return any(_command_lookup_key(name) in target_keys for name in candidates)
+
+
 def _wrapper_conflict_warnings_for_command(
     db: Dict[str, Any],
     command_name: str,
@@ -1011,13 +1032,19 @@ def _wrapper_conflict_warnings_for_command(
     if namespace_prefix:
         target_keys.add(_command_lookup_key(namespace_prefix))
 
+    relevant_errors = [
+        message
+        for message in errors
+        if _is_relevant_wrapper_collision_error(message, target_keys)
+    ]
+
     warnings: List[str] = []
     for wrapper_name, blocked_command in blocked.items():
         if _command_lookup_key(blocked_command) not in target_keys:
             continue
         warnings.append(_format_conflict_warning(wrapper_name, blocked_command))
 
-    return [*errors, *warnings]
+    return [*relevant_errors, *warnings]
 
 
 
@@ -1033,11 +1060,17 @@ def sync_binaries(
     errors: List[str] = []
     plat = platform_name or os.name
     target_dir = bin_dir or _script_bin_dir(plat)
-    try:
-        os.makedirs(target_dir, exist_ok=True)
-    except OSError as exc:
-        reason = exc.strerror or str(exc)
-        return [f"failed to create wrapper directory '{target_dir}': {reason}"]
+    if uninstall:
+        if not os.path.exists(target_dir):
+            return errors
+        if not os.path.isdir(target_dir):
+            return [f"wrapper directory path is not a directory: '{target_dir}'"]
+    else:
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            return [f"failed to create wrapper directory '{target_dir}': {reason}"]
 
     custom_wrappers: Dict[str, str] = {}
     if not uninstall:
@@ -1189,12 +1222,18 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
 
     parent = os.path.dirname(file_path)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            return [f"failed to create command directory '{parent}': {exc}"]
 
     clean_cfg = {k: v for k, v in cfg.items() if k != '_source'}
     data[name] = clean_cfg
-    with open(file_path, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(data, f, sort_keys=False)
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+    except (OSError, yaml.YAMLError) as exc:
+        return [f"failed to write command file '{file_path}': {exc}"]
 
     sync_messages = sync_binaries(load_cmds(find_yamls()))
     if not _report_sync_messages(sync_messages, emit=False):
@@ -1779,6 +1818,7 @@ class PExpectProcessAdapter(ProcessAdapter):
             _shell_name(),
             ['-c', command],
             encoding='utf-8',
+            codec_errors='replace',
             timeout=timeout,
         )
         self._log_sink = _PExpectLogSink(sys.stdout)
@@ -2174,7 +2214,10 @@ def _prepare_update_source() -> Tuple[str, Optional[str]]:
     os.close(fd)
 
     try:
-        with urllib.request.urlopen(UPDATE_TARBALL_URL) as response, open(archive_path, 'wb') as out:
+        with urllib.request.urlopen(
+            UPDATE_TARBALL_URL,
+            timeout=DEFAULT_UPDATE_DOWNLOAD_TIMEOUT,
+        ) as response, open(archive_path, 'wb') as out:
             shutil.copyfileobj(response, out)
     except (OSError, urllib.error.URLError) as exc:
         try:

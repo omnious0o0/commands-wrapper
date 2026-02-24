@@ -324,12 +324,41 @@ class CommandsWrapperTests(unittest.TestCase):
             namespace_content = namespace_wrapper.read_text(encoding="utf-8")
             self.assertIn(' claw "$@"', namespace_content)
 
+    def test_sync_binaries_skips_primary_wrapper_name(self):
+        db = {
+            "commands-wrapper": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                messages = cw.sync_binaries(
+                    db,
+                    bin_dir=str(target_bin),
+                    platform_name="posix",
+                    report_conflicts=False,
+                )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            self.assertFalse((target_bin / cw.PRIMARY_WRAPPER).is_file())
+
     def test_wrapper_name_from_command_name_normalizes_case(self):
         self.assertEqual(cw._wrapper_name_from_command_name("My Cmd"), "my-cmd")
+
+    def test_wrapper_name_from_command_name_rejects_primary_wrapper(self):
+        self.assertIsNone(cw._wrapper_name_from_command_name(cw.PRIMARY_WRAPPER))
 
     def test_wrapper_alias_from_command_name_preserves_case(self):
         self.assertEqual(cw._wrapper_alias_from_command_name("OAA"), "OAA")
         self.assertIsNone(cw._wrapper_alias_from_command_name("oaa"))
+
+    def test_wrapper_alias_from_command_name_rejects_primary_wrapper(self):
+        self.assertIsNone(cw._wrapper_alias_from_command_name("Commands-Wrapper"))
 
     def test_build_wrapper_map_adds_case_alias_wrapper(self):
         wrappers, errors = cw._build_wrapper_map(
@@ -539,13 +568,22 @@ class CommandsWrapperTests(unittest.TestCase):
         dummy_spawn = DummySpawn()
 
         with (
-            mock.patch.object(cw.pexpect, "spawn", return_value=dummy_spawn),
+            mock.patch.object(
+                cw.pexpect, "spawn", return_value=dummy_spawn
+            ) as spawn_mock,
             mock.patch.object(cw, "_shell_name", return_value="/bin/sh"),
         ):
             adapter = cw.PExpectProcessAdapter("echo hi", timeout=None)
 
         self.assertIs(adapter._proc, dummy_spawn)
         self.assertIsInstance(dummy_spawn.logfile_read, cw._PExpectLogSink)
+        spawn_mock.assert_called_once_with(
+            "/bin/sh",
+            ["-c", "echo hi"],
+            encoding="utf-8",
+            codec_errors="replace",
+            timeout=None,
+        )
 
     @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
     @unittest.skipIf(getattr(cw, "_termios", None) is None, "termios unavailable")
@@ -707,6 +745,71 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue(messages)
             self.assertIn("failed to parse command file", messages[0])
             self.assertEqual(commands_file.read_text(encoding="utf-8"), "bad: [\n")
+
+    def test_save_cmd_returns_error_when_parent_directory_creation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_file = Path(tmp) / "nested" / "commands.yaml"
+
+            with mock.patch.object(cw.os, "makedirs", side_effect=OSError("denied")):
+                messages = cw.save_cmd(
+                    "safe",
+                    {
+                        "description": "demo",
+                        "steps": [{"command": "echo hi"}],
+                    },
+                    str(target_file),
+                )
+
+            self.assertTrue(messages)
+            self.assertIn("failed to create command directory", messages[0])
+
+    def test_save_cmd_returns_error_when_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'Foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+            real_open = open
+
+            def flaky_open(path, mode="r", *args, **kwargs):
+                if str(path) == str(commands_file) and "w" in mode:
+                    raise OSError("disk full")
+                return real_open(path, mode, *args, **kwargs)
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch("builtins.open", side_effect=flaky_open),
+                ):
+                    messages = cw.save_cmd(
+                        "Bar",
+                        {
+                            "description": "second",
+                            "steps": [{"command": "echo two"}],
+                        },
+                        str(commands_file),
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertTrue(messages)
+            self.assertIn("failed to write command file", messages[0])
 
     def test_save_cmd_rolls_back_file_when_sync_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -982,6 +1085,36 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertTrue(any("'cc'" in text for text in warning_texts))
         self.assertFalse(any("'extract'" in text for text in warning_texts))
 
+    def test_wrapper_conflict_warnings_for_command_filters_unrelated_collisions(self):
+        db = {
+            "cc": {
+                "description": "demo",
+                "steps": [{"command": "echo cc"}],
+            },
+            "extract": {
+                "description": "demo",
+                "steps": [{"command": "echo extract"}],
+            },
+        }
+
+        with mock.patch.object(
+            cw,
+            "_build_wrapper_map_with_conflicts",
+            return_value=(
+                {},
+                ["wrapper name collision for 'extract': 'extract' vs 'extract two'"],
+                {"cc": "cc", "extract": "extract"},
+            ),
+        ):
+            warnings = cw._wrapper_conflict_warnings_for_command(
+                db,
+                "cc",
+                "/tmp/target-bin",
+            )
+
+        self.assertTrue(any("'cc'" in message for message in warnings))
+        self.assertFalse(any("collision" in message for message in warnings))
+
     def test_main_multi_word_command_reports_namespace_conflict_only(self):
         db = {
             "claw doc": {
@@ -1016,6 +1149,21 @@ class CommandsWrapperTests(unittest.TestCase):
         warning_texts = [str(call.args[0]) for call in warn_mock.call_args_list]
         self.assertTrue(any("'claw'" in text for text in warning_texts))
         self.assertFalse(any("'extract'" in text for text in warning_texts))
+
+    def test_sync_binaries_uninstall_does_not_create_missing_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_dir = Path(tmp) / "missing-bin"
+            self.assertFalse(missing_dir.exists())
+
+            messages = cw.sync_binaries(
+                {},
+                uninstall=True,
+                bin_dir=str(missing_dir),
+                platform_name="posix",
+            )
+
+            self.assertEqual(messages, [])
+            self.assertFalse(missing_dir.exists())
 
     def test_main_sync_uninstall_is_not_shadowed_by_user_command(self):
         db = {
@@ -1162,6 +1310,8 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$LASTEXITCODE -ne 0", content)
         self.assertIn("function Get-PythonScriptsDir", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
+        self.assertIn("function Test-CommandsWrapperSourceRoot", content)
+        self.assertIn(".commands-wrapper", content)
         self.assertIn("COMMANDS_WRAPPER_SOURCE_URL", content)
         self.assertIn("COMMANDS_WRAPPER_SOURCE_SHA256", content)
         self.assertIn("commands-wrapper.exe", content)

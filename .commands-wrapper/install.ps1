@@ -100,6 +100,19 @@ function Resolve-WrapperSyncCommand {
     return $null
 }
 
+function Test-CommandsWrapperSourceRoot {
+    param([string]$Root)
+
+    if (-not $Root) {
+        return $false
+    }
+
+    $pyproject = Join-Path $Root "pyproject.toml"
+    $cliPath = Join-Path (Join-Path $Root ".commands-wrapper") "commands-wrapper"
+
+    return (Test-Path $pyproject) -and (Test-Path $cliPath)
+}
+
 $repoRoot = $null
 if ($MyInvocation.MyCommand.Path) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -109,9 +122,13 @@ if ($MyInvocation.MyCommand.Path) {
 }
 
 $cwdRoot = (Get-Location).Path
-$localProject = $null
-if ($repoRoot) {
-    $localProject = Join-Path $repoRoot "pyproject.toml"
+$repoSourceRoot = $null
+if (Test-CommandsWrapperSourceRoot -Root $repoRoot) {
+    $repoSourceRoot = $repoRoot
+}
+$cwdSourceRoot = $null
+if (Test-CommandsWrapperSourceRoot -Root $cwdRoot) {
+    $cwdSourceRoot = $cwdRoot
 }
 $sourceUrl = if ($env:COMMANDS_WRAPPER_SOURCE_URL) {
     $env:COMMANDS_WRAPPER_SOURCE_URL
@@ -128,10 +145,10 @@ if ($sourceSha256 -and $sourceSha256 -notmatch '^[0-9a-f]{64}$') {
     throw "invalid COMMANDS_WRAPPER_SOURCE_SHA256 value"
 }
 
-if ($localProject -and (Test-Path $localProject)) {
-    Invoke-Python @("-m", "pip", "install", $repoRoot)
-} elseif (Test-Path (Join-Path $cwdRoot "pyproject.toml")) {
-    Invoke-Python @("-m", "pip", "install", $cwdRoot)
+if ($repoSourceRoot) {
+    Invoke-Python @("-m", "pip", "install", $repoSourceRoot)
+} elseif ($cwdSourceRoot) {
+    Invoke-Python @("-m", "pip", "install", $cwdSourceRoot)
 } else {
     if ($sourceSha256) {
         $tempArchive = Join-Path ([System.IO.Path]::GetTempPath()) ("commands-wrapper-" + [guid]::NewGuid().ToString() + ".tar.gz")
