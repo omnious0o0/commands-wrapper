@@ -47,6 +47,9 @@ class _MenuFakeWindow:
     def refresh(self):
         return None
 
+    def nodelay(self, _enabled):
+        return None
+
     def getch(self):
         if not self._keys:
             return ord("\n")
@@ -81,6 +84,38 @@ class CommandsWrapperTests(unittest.TestCase):
             OK=lambda: 0,
             ERR=lambda: 0,
             HDR=lambda: 0,
+        ):
+            choice = cw.menu(win, "Test", ["one", "two", "three"])
+        self.assertEqual(choice, 1)
+
+    def test_menu_plain_escape_cancels(self):
+        win = _MenuFakeWindow([27])
+        with (
+            mock.patch.multiple(
+                cw,
+                SEL=lambda: 0,
+                DIM=lambda: 0,
+                OK=lambda: 0,
+                ERR=lambda: 0,
+                HDR=lambda: 0,
+            ),
+            mock.patch.object(cw, "_read_esc_followup_key", return_value=-1),
+        ):
+            choice = cw.menu(win, "Test", ["one", "two", "three"])
+        self.assertIsNone(choice)
+
+    def test_menu_alt_j_moves_down_instead_of_cancel(self):
+        win = _MenuFakeWindow([27, ord("\n")])
+        with (
+            mock.patch.multiple(
+                cw,
+                SEL=lambda: 0,
+                DIM=lambda: 0,
+                OK=lambda: 0,
+                ERR=lambda: 0,
+                HDR=lambda: 0,
+            ),
+            mock.patch.object(cw, "_read_esc_followup_key", return_value=ord("j")),
         ):
             choice = cw.menu(win, "Test", ["one", "two", "three"])
         self.assertEqual(choice, 1)
@@ -588,6 +623,57 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("failed to parse command file", messages[0])
             self.assertEqual(commands_file.read_text(encoding="utf-8"), "bad: [\n")
 
+    def test_save_cmd_rolls_back_file_when_sync_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'Foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(
+                        cw,
+                        "sync_binaries",
+                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                    ),
+                ):
+                    messages = cw.save_cmd(
+                        "Bar",
+                        {
+                            "description": "second",
+                            "steps": [{"command": "echo two"}],
+                        },
+                        str(commands_file),
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertTrue(messages)
+            self.assertIn(
+                "wrapper sync failed; source file was restored", "\n".join(messages)
+            )
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("Foo:", content)
+            self.assertNotIn("Bar:", content)
+
     def test_cmd_add_yaml_exits_nonzero_on_case_insensitive_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -674,6 +760,95 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("conflicts with existing command", err_message)
             self.assertEqual(sync_messages, [])
 
+    def test_remove_from_file_rolls_back_on_sync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'Foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(
+                        cw,
+                        "sync_binaries",
+                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                    ),
+                ):
+                    removed, err_message, sync_messages = cw.remove_from_file(
+                        "Foo", str(commands_file)
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertFalse(removed)
+            self.assertIn("source file was restored", err_message)
+            self.assertTrue(sync_messages)
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("Foo:", content)
+
+    def test_rename_in_file_rolls_back_on_sync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'Foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(
+                        cw,
+                        "sync_binaries",
+                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                    ),
+                ):
+                    renamed, err_message, sync_messages = cw.rename_in_file(
+                        "Foo", "Bar", str(commands_file)
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertFalse(renamed)
+            self.assertIn("source file was restored", err_message)
+            self.assertTrue(sync_messages)
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("Foo:", content)
+            self.assertNotIn("Bar:", content)
+
     def test_main_list_uses_non_conflict_sync_path(self):
         with (
             mock.patch.object(cw, "load_cmds", return_value={}),
@@ -684,8 +859,28 @@ class CommandsWrapperTests(unittest.TestCase):
         ):
             cw.main()
 
-        sync_mock.assert_called_once_with({}, report_conflicts=False)
+        sync_mock.assert_called_once_with({}, report_conflicts=True)
         list_mock.assert_called_once_with({})
+
+    def test_main_sync_uninstall_is_not_shadowed_by_user_command(self):
+        db = {
+            "sync --uninstall": {
+                "description": "demo",
+                "steps": [{"command": "echo should-not-run"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock,
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "sync", "--uninstall"]),
+        ):
+            cw.main()
+
+        exec_mock.assert_not_called()
+        sync_mock.assert_called_once_with(db, uninstall=True)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_install_sh_local_source_does_not_require_curl_or_tar(self):
@@ -754,7 +949,7 @@ class CommandsWrapperTests(unittest.TestCase):
         if not Path("/bin/bash").is_file():
             self.skipTest("/bin/bash not available")
 
-        install_script = SCRIPT_PATH.parent / "install.sh"
+        source_install_script = SCRIPT_PATH.parent / "install.sh"
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -762,6 +957,13 @@ class CommandsWrapperTests(unittest.TestCase):
             work = root / "work"
             fake_bin.mkdir(parents=True)
             work.mkdir(parents=True)
+
+            install_script = work / "install.sh"
+            install_script.write_text(
+                source_install_script.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            install_script.chmod(0o755)
 
             python_stub = fake_bin / "python3"
             python_stub.write_text(
@@ -909,6 +1111,22 @@ class CommandsWrapperTests(unittest.TestCase):
         error_mock.assert_called_once_with(
             "invalid COMMANDS_WRAPPER_UPDATE_SHA256 value"
         )
+
+    def test_pip_uninstall_exits_zero_when_package_absent(self):
+        with (
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_run_pip", return_value=1) as run_pip_mock,
+            mock.patch.object(cw, "_warn") as warn_mock,
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw._pip_uninstall()
+
+        self.assertEqual(exc.exception.code, 0)
+        run_pip_mock.assert_called_once_with(
+            ["show", cw.PRIMARY_WRAPPER], suppress_output=True
+        )
+        warn_mock.assert_called_once_with(f"{cw.PRIMARY_WRAPPER} is not installed.")
 
     def test_uninstall_ps1_includes_exit_code_guards(self):
         uninstall_ps1 = SCRIPT_PATH.parent / "uninstall.ps1"

@@ -44,6 +44,13 @@ print(digest.hexdigest())
 PY
 }
 
+is_commands_wrapper_source_root() {
+    local root="$1"
+    [ -f "$root/pyproject.toml" ] || return 1
+    [ -f "$root/.commands-wrapper/commands-wrapper" ] || return 1
+    return 0
+}
+
 # Dependencies
 echo -n -e "${GRAY}[1/4] Checking dependencies... ${RESET}"
 if ! command -v python3 &>/dev/null; then
@@ -57,11 +64,30 @@ fi
 echo -e "${GREEN}OK${RESET}"
 
 INSTALL_CWD=$(pwd)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+case "$SCRIPT_PATH" in
+    */*)
+        SCRIPT_DIR="$(cd -- "${SCRIPT_PATH%/*}" && pwd)"
+        ;;
+    *)
+        SCRIPT_DIR="$INSTALL_CWD"
+        ;;
+esac
+SCRIPT_REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 # Source
 echo -n -e "${GRAY}[2/4] Preparing source... ${RESET}"
 TMP_DIR=""
-if [ ! -f "pyproject.toml" ]; then
+LOCAL_SOURCE_ROOT=""
+if is_commands_wrapper_source_root "$SCRIPT_REPO_ROOT"; then
+    LOCAL_SOURCE_ROOT="$SCRIPT_REPO_ROOT"
+elif is_commands_wrapper_source_root "$INSTALL_CWD"; then
+    LOCAL_SOURCE_ROOT="$INSTALL_CWD"
+fi
+
+if [ -n "$LOCAL_SOURCE_ROOT" ]; then
+    cd "$LOCAL_SOURCE_ROOT"
+else
     if ! command -v curl &>/dev/null; then
         echo -e "${RED}curl not found (required for remote install).${RESET}"
         exit 1

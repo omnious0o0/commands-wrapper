@@ -287,13 +287,19 @@ def menu(win, title: str, options: List[str], status: str = "") -> Optional[int]
         win.refresh()
         key = win.getch()
 
+        if key == 27:  # ESC or Alt+key
+            nk = _read_esc_followup_key(win)
+            if nk == -1:
+                return None
+            key = nk
+
         if key in (curses.KEY_UP, ord('k'), ord('K')):
             cur = (cur - 1) % len(options)
         elif key in (curses.KEY_DOWN, ord('j'), ord('J')):
             cur = (cur + 1) % len(options)
         elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
             return cur
-        elif key in (ord('q'), ord('Q'), 27):
+        elif key in (ord('q'), ord('Q')):
             return None
 
 
@@ -1069,12 +1075,28 @@ def sync_binaries(
 
     return errors
 
+
+def _restore_command_file_snapshot(file_path: str, snapshot: Optional[str]) -> Optional[str]:
+    try:
+        if snapshot is None:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        else:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(snapshot)
+    except OSError as exc:
+        return f"failed to restore source file: {exc}"
+
+    return None
+
 def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
     data: Dict[str, Any] = {}
+    original_content: Optional[str] = None
     if os.path.exists(file_path):
         try:
             with open(file_path, encoding='utf-8') as f:
-                loaded = yaml.safe_load(f)
+                original_content = f.read()
+                loaded = yaml.safe_load(original_content)
                 if isinstance(loaded, dict):
                     data = loaded
         except OSError as exc:
@@ -1101,7 +1123,26 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
     data[name] = clean_cfg
     with open(file_path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(data, f, sort_keys=False)
-    return sync_binaries(load_cmds(find_yamls()))
+
+    sync_messages = sync_binaries(load_cmds(find_yamls()))
+    if not _report_sync_messages(sync_messages, emit=False):
+        return sync_messages
+
+    rollback_error = _restore_command_file_snapshot(file_path, original_content)
+    rollback_sync_messages = sync_binaries(load_cmds(find_yamls()))
+
+    messages = list(sync_messages)
+    if rollback_error:
+        messages.append(rollback_error)
+        return messages
+
+    if _report_sync_messages(rollback_sync_messages, emit=False):
+        messages.append("failed to restore wrappers after source rollback")
+        messages.extend(rollback_sync_messages)
+    else:
+        messages.append("wrapper sync failed; source file was restored")
+
+    return messages
 
 
 def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
@@ -1109,7 +1150,8 @@ def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
         return False, f"source file not found: {file_path}", []
     try:
         with open(file_path, encoding='utf-8') as f:
-            loaded = yaml.safe_load(f)
+            original_content = f.read()
+            loaded = yaml.safe_load(original_content)
             data = loaded if isinstance(loaded, dict) else {}
 
         if name not in data:
@@ -1120,6 +1162,21 @@ def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
             yaml.safe_dump(data, f, sort_keys=False)
 
         sync_errors = sync_binaries(load_cmds(find_yamls()))
+        if _report_sync_messages(sync_errors, emit=False):
+            rollback_error = _restore_command_file_snapshot(file_path, original_content)
+            rollback_sync_errors = sync_binaries(load_cmds(find_yamls()))
+
+            if rollback_error:
+                return False, f"wrapper sync failed and rollback failed: {rollback_error}", sync_errors
+            if _report_sync_messages(rollback_sync_errors, emit=False):
+                return (
+                    False,
+                    "wrapper sync failed and source file was restored, but wrapper rollback failed",
+                    [*sync_errors, *rollback_sync_errors],
+                )
+
+            return False, "wrapper sync failed; source file was restored", sync_errors
+
         return True, "", sync_errors
     except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to update source file: {exc}", []
@@ -1131,7 +1188,8 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
 
     try:
         with open(file_path, encoding='utf-8') as f:
-            loaded = yaml.safe_load(f)
+            original_content = f.read()
+            loaded = yaml.safe_load(original_content)
             data = loaded if isinstance(loaded, dict) else {}
     except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to read source file: {exc}", []
@@ -1165,6 +1223,21 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
         return False, f"failed to write source file: {exc}", []
 
     sync_messages = sync_binaries(load_cmds(find_yamls()))
+    if _report_sync_messages(sync_messages, emit=False):
+        rollback_error = _restore_command_file_snapshot(file_path, original_content)
+        rollback_sync_messages = sync_binaries(load_cmds(find_yamls()))
+
+        if rollback_error:
+            return False, f"wrapper sync failed and rollback failed: {rollback_error}", sync_messages
+        if _report_sync_messages(rollback_sync_messages, emit=False):
+            return (
+                False,
+                "wrapper sync failed and source file was restored, but wrapper rollback failed",
+                [*sync_messages, *rollback_sync_messages],
+            )
+
+        return False, "wrapper sync failed; source file was restored", sync_messages
+
     return True, "", sync_messages
 
 
@@ -1953,6 +2026,11 @@ def _pip_install():
 def _pip_uninstall():
     sync_errors = sync_binaries({}, uninstall=True)
     _report_sync_messages(sync_errors)
+
+    if _run_pip(['show', PRIMARY_WRAPPER], suppress_output=True) != 0:
+        _warn(f"{PRIMARY_WRAPPER} is not installed.")
+        sys.exit(0)
+
     return_code = _run_pip(['uninstall', PRIMARY_WRAPPER, '-y'])
     if return_code == 0:
         _ok(f"Uninstalled {PRIMARY_WRAPPER}.")
@@ -2116,7 +2194,18 @@ def main():
         sys.exit(1)
 
     if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
-        _report_sync_messages(sync_binaries(db, report_conflicts=False))
+        _report_sync_messages(sync_binaries(db, report_conflicts=True))
+
+    if normalized_action == 'sync':
+        is_uninstall = "--uninstall" in sys.argv
+        if not is_uninstall:
+            _warn("Manual sync is no longer required. Wrappers are synced automatically.")
+        sync_errors = sync_binaries(db, uninstall=is_uninstall)
+        if _report_sync_messages(sync_errors):
+            sys.exit(1)
+        if not is_uninstall:
+            _ok("Automatic wrapper sync complete.")
+        return
 
     resolved_full_action = _resolve_command_name(full_action, db, lookup_index)
     if resolved_full_action:
@@ -2147,16 +2236,6 @@ def main():
             for wrapper_name, command_name in sorted(wrappers.items()):
                 quoted_command = shlex.quote(command_name)
                 print(f"alias {wrapper_name}=\"{PRIMARY_WRAPPER} {quoted_command}\"")
-
-    elif normalized_action == 'sync':
-        is_uninstall = "--uninstall" in sys.argv
-        if not is_uninstall:
-            _warn("Manual sync is no longer required. Wrappers are synced automatically.")
-        sync_errors = sync_binaries(db, uninstall=is_uninstall)
-        if _report_sync_messages(sync_errors):
-            sys.exit(1)
-        if not is_uninstall:
-            _ok("Automatic wrapper sync complete.")
 
     elif normalized_action in ('configure', 'config'):
         run_wizard()
