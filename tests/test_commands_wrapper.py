@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
@@ -518,6 +519,33 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIs(returned, proc)
         self.assertEqual(proc.calls, [("sendline", "")])
+
+    def test_pexpect_log_sink_accepts_text_and_bytes(self):
+        stream = io.StringIO()
+        sink = cw._PExpectLogSink(stream)
+
+        sink.write("hello")
+        sink.write(b" world")
+        sink.flush()
+
+        self.assertEqual(stream.getvalue(), "hello world")
+
+    @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
+    def test_pexpect_adapter_uses_safe_log_sink(self):
+        class DummySpawn:
+            def __init__(self):
+                self.logfile_read = None
+
+        dummy_spawn = DummySpawn()
+
+        with (
+            mock.patch.object(cw.pexpect, "spawn", return_value=dummy_spawn),
+            mock.patch.object(cw, "_shell_name", return_value="/bin/sh"),
+        ):
+            adapter = cw.PExpectProcessAdapter("echo hi", timeout=None)
+
+        self.assertIs(adapter._proc, dummy_spawn)
+        self.assertIsInstance(dummy_spawn.logfile_read, cw._PExpectLogSink)
 
     @unittest.skipIf(not cw.PEXPECT_AVAILABLE, "pexpect unavailable")
     @unittest.skipIf(getattr(cw, "_termios", None) is None, "termios unavailable")

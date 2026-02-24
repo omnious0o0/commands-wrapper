@@ -35,7 +35,7 @@ PEXPECT_AVAILABLE = _pexpect is not None
 curses: Any = _curses
 pexpect: Any = _pexpect
 
-NON_INTERACTIVE_INTERACT_EXCEPTIONS: Tuple[type, ...] = (OSError, ValueError)
+NON_INTERACTIVE_INTERACT_EXCEPTIONS: Tuple[type[BaseException], ...] = (OSError, ValueError)
 if PEXPECT_AVAILABLE:
     NON_INTERACTIVE_INTERACT_EXCEPTIONS = (
         *NON_INTERACTIVE_INTERACT_EXCEPTIONS,
@@ -1740,6 +1740,38 @@ class ProcessAdapter:
         raise NotImplementedError
 
 
+class _PExpectLogSink:
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._buffer = getattr(stream, 'buffer', None)
+
+    def write(self, data: Any) -> int:
+        if isinstance(data, bytes):
+            if self._buffer is not None:
+                self._buffer.write(data)
+                return len(data)
+
+            text = data.decode('utf-8', errors='replace')
+            self._stream.write(text)
+            return len(data)
+
+        text = str(data)
+        self._stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer is not None:
+            try:
+                self._buffer.flush()
+            except (OSError, ValueError, AttributeError):
+                pass
+
+        try:
+            self._stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
 class PExpectProcessAdapter(ProcessAdapter):
     def __init__(self, command: str, timeout: Optional[int]):
         self._command = command
@@ -1749,7 +1781,8 @@ class PExpectProcessAdapter(ProcessAdapter):
             encoding='utf-8',
             timeout=timeout,
         )
-        self._proc.logfile_read = sys.stdout
+        self._log_sink = _PExpectLogSink(sys.stdout)
+        self._proc.logfile_read = self._log_sink
 
     def isalive(self) -> bool:
         return self._proc.isalive()
