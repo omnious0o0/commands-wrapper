@@ -682,7 +682,7 @@ def _scan_yaml_files(directory: str) -> List[str]:
 
     results: List[str] = []
     try:
-        for entry in os.listdir(directory):
+        for entry in sorted(os.listdir(directory), key=lambda entry: (entry.casefold(), entry)):
             if entry.startswith('.'):
                 continue
             if not entry.endswith(('.yaml', '.yml')):
@@ -769,6 +769,15 @@ def _report_sync_messages(messages: List[str], emit: bool = True) -> bool:
     return has_errors
 
 
+def _first_non_warning_message(messages: List[str]) -> Optional[str]:
+    for message in messages:
+        if not message.startswith("WARN: "):
+            return message
+    if messages:
+        return messages[0]
+    return None
+
+
 def load_cmds(files: List[str], warnings: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
     cmds = {}
     for f in files:
@@ -798,6 +807,32 @@ def load_cmds(files: List[str], warnings: Optional[List[str]] = None) -> Dict[st
             v['_source'] = f
             cmds[k] = v
     return cmds
+
+
+def _load_commands_for_sync() -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    db = load_cmds(find_yamls(), warnings=warnings)
+    return db, warnings
+
+
+def _sync_messages_with_load_warnings(
+    db: Dict[str, Any],
+    load_warnings: List[str],
+    *,
+    uninstall: bool = False,
+    report_conflicts: bool = True,
+) -> List[str]:
+    messages = [f"WARN: {warning}" for warning in load_warnings]
+    sync_kwargs: Dict[str, Any] = {
+        'uninstall': uninstall,
+        'report_conflicts': report_conflicts,
+    }
+    if load_warnings:
+        sync_kwargs['prune_stale'] = False
+        messages.append("WARN: skipped stale wrapper cleanup due to command-file load warnings")
+
+    messages.extend(sync_binaries(db, **sync_kwargs))
+    return messages
 
 
 def _is_own_wrapper_path(path: str, target_dir: str) -> bool:
@@ -1059,6 +1094,46 @@ def _wrapper_conflict_warnings_for_command(
     return [*relevant_errors, *warnings]
 
 
+def _atomic_write_text(file_path: str, content: str) -> None:
+    parent = os.path.dirname(file_path) or '.'
+    fd: Optional[int] = None
+    temp_path: Optional[str] = None
+
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix='.commands-wrapper-',
+            suffix='.tmp',
+            dir=parent,
+        )
+
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as temp_file:
+            fd = None
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, file_path)
+
+        if os.name != 'nt':
+            dir_fd: Optional[int] = None
+            try:
+                dir_fd = os.open(parent, os.O_RDONLY)
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                if dir_fd is not None:
+                    os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
 
 def sync_binaries(
     db: Dict[str, Any],
@@ -1066,6 +1141,7 @@ def sync_binaries(
     bin_dir: Optional[str] = None,
     platform_name: Optional[str] = None,
     report_conflicts: bool = True,
+    prune_stale: bool = True,
 )-> List[str]:
     import stat
 
@@ -1119,18 +1195,19 @@ def sync_binaries(
         errors.append(f"failed to list wrapper directory '{target_dir}': {reason}")
         existing_files = []
 
-    for filename in existing_files:
-        path = os.path.join(target_dir, filename)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
-                header = fd.read(160)
-            if WRAPPER_MARKER in header and filename not in expected_files:
-                os.remove(path)
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            errors.append(f"failed to reconcile wrapper '{path}': {reason}")
+    if prune_stale:
+        for filename in existing_files:
+            path = os.path.join(target_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as fd:
+                    header = fd.read(160)
+                if WRAPPER_MARKER in header and filename not in expected_files:
+                    os.remove(path)
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+                errors.append(f"failed to reconcile wrapper '{path}': {reason}")
 
     if uninstall:
         return errors
@@ -1169,8 +1246,7 @@ def sync_binaries(
 
             for wrapper_path, content in ((cmd_path, cmd_content), (ps1_path, ps1_content)):
                 try:
-                    with open(wrapper_path, 'w', encoding='utf-8', newline='\n') as fd:
-                        fd.write(content)
+                    _atomic_write_text(wrapper_path, content)
                 except OSError as exc:
                     reason = exc.strerror or str(exc)
                     errors.append(f"failed to write wrapper '{wrapper_path}': {reason}")
@@ -1182,8 +1258,7 @@ def sync_binaries(
                 f'{unix_exec_line}'
             )
             try:
-                with open(script_path, 'w', encoding='utf-8', newline='\n') as fd:
-                    fd.write(content)
+                _atomic_write_text(script_path, content)
                 st = os.stat(script_path)
                 os.chmod(script_path, st.st_mode | stat.S_IEXEC)
             except OSError as exc:
@@ -1193,43 +1268,28 @@ def sync_binaries(
     return errors
 
 
-def _restore_command_file_snapshot(file_path: str, snapshot: Optional[str]) -> Optional[str]:
-    try:
-        if snapshot is None:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        else:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(snapshot)
-    except OSError as exc:
-        return f"failed to restore source file: {exc}"
-
-    return None
-
-def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
+def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> Tuple[bool, List[str]]:
     data: Dict[str, Any] = {}
-    original_content: Optional[str] = None
     if os.path.exists(file_path):
         try:
             with open(file_path, encoding='utf-8') as f:
-                original_content = f.read()
-                loaded = yaml.safe_load(original_content)
+                loaded = yaml.safe_load(f)
                 if isinstance(loaded, dict):
                     data = loaded
         except OSError as exc:
-            return [f"failed to read command file '{file_path}': {exc}"]
+            return False, [f"failed to read command file '{file_path}': {exc}"]
         except yaml.YAMLError as exc:
-            return [f"failed to parse command file '{file_path}': {exc}"]
+            return False, [f"failed to parse command file '{file_path}': {exc}"]
 
     all_commands = load_cmds(find_yamls())
-    lookup_index, lookup_errors = _build_command_lookup_index(all_commands)
-    if lookup_errors:
-        return lookup_errors
-
-    existing_name = lookup_index.get(_command_lookup_key(name))
-    if existing_name and existing_name != name:
-        return [
-            f"command name '{name}' conflicts with existing command '{existing_name}' under case-insensitive lookup"
+    conflict_name = _find_case_insensitive_conflict(
+        name,
+        list(all_commands.keys()),
+        ignore_name=name,
+    )
+    if conflict_name:
+        return False, [
+            f"command name '{name}' conflicts with existing command '{conflict_name}' under case-insensitive lookup"
         ]
 
     parent = os.path.dirname(file_path)
@@ -1237,35 +1297,18 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> List[str]:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as exc:
-            return [f"failed to create command directory '{parent}': {exc}"]
+            return False, [f"failed to create command directory '{parent}': {exc}"]
 
     clean_cfg = {k: v for k, v in cfg.items() if k != '_source'}
     data[name] = clean_cfg
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            yaml.safe_dump(data, f, sort_keys=False)
+        content = yaml.safe_dump(data, sort_keys=False)
+        _atomic_write_text(file_path, content)
     except (OSError, yaml.YAMLError) as exc:
-        return [f"failed to write command file '{file_path}': {exc}"]
+        return False, [f"failed to write command file '{file_path}': {exc}"]
 
-    sync_messages = sync_binaries(load_cmds(find_yamls()))
-    if not _report_sync_messages(sync_messages, emit=False):
-        return sync_messages
-
-    rollback_error = _restore_command_file_snapshot(file_path, original_content)
-    rollback_sync_messages = sync_binaries(load_cmds(find_yamls()))
-
-    messages = list(sync_messages)
-    if rollback_error:
-        messages.append(rollback_error)
-        return messages
-
-    if _report_sync_messages(rollback_sync_messages, emit=False):
-        messages.append("failed to restore wrappers after source rollback")
-        messages.extend(rollback_sync_messages)
-    else:
-        messages.append("wrapper sync failed; source file was restored")
-
-    return messages
+    sync_db, sync_load_warnings = _load_commands_for_sync()
+    return True, _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
 
 
 def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
@@ -1273,34 +1316,19 @@ def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
         return False, f"source file not found: {file_path}", []
     try:
         with open(file_path, encoding='utf-8') as f:
-            original_content = f.read()
-            loaded = yaml.safe_load(original_content)
+            loaded = yaml.safe_load(f)
             data = loaded if isinstance(loaded, dict) else {}
 
         if name not in data:
             return False, f"'{name}' not found in source file", []
 
         del data[name]
-        with open(file_path, 'w', encoding='utf-8') as f:
-            yaml.safe_dump(data, f, sort_keys=False)
+        content = yaml.safe_dump(data, sort_keys=False)
+        _atomic_write_text(file_path, content)
 
-        sync_errors = sync_binaries(load_cmds(find_yamls()))
-        if _report_sync_messages(sync_errors, emit=False):
-            rollback_error = _restore_command_file_snapshot(file_path, original_content)
-            rollback_sync_errors = sync_binaries(load_cmds(find_yamls()))
-
-            if rollback_error:
-                return False, f"wrapper sync failed and rollback failed: {rollback_error}", sync_errors
-            if _report_sync_messages(rollback_sync_errors, emit=False):
-                return (
-                    False,
-                    "wrapper sync failed and source file was restored, but wrapper rollback failed",
-                    [*sync_errors, *rollback_sync_errors],
-                )
-
-            return False, "wrapper sync failed; source file was restored", sync_errors
-
-        return True, "", sync_errors
+        sync_db, sync_load_warnings = _load_commands_for_sync()
+        sync_messages = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
+        return True, "", sync_messages
     except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to update source file: {exc}", []
 
@@ -1311,8 +1339,7 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
 
     try:
         with open(file_path, encoding='utf-8') as f:
-            original_content = f.read()
-            loaded = yaml.safe_load(original_content)
+            loaded = yaml.safe_load(f)
             data = loaded if isinstance(loaded, dict) else {}
     except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to read source file: {exc}", []
@@ -1321,15 +1348,15 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
         return False, f"'{old_name}' not found in source file", []
 
     all_commands = load_cmds(find_yamls())
-    lookup_index, lookup_errors = _build_command_lookup_index(all_commands)
-    if lookup_errors:
-        return False, lookup_errors[0], []
-
-    existing_name = lookup_index.get(_command_lookup_key(new_name))
-    if existing_name and existing_name != old_name:
+    conflict_name = _find_case_insensitive_conflict(
+        new_name,
+        list(all_commands.keys()),
+        ignore_name=old_name,
+    )
+    if conflict_name:
         return (
             False,
-            f"'{new_name}' conflicts with existing command '{existing_name}' under case-insensitive lookup",
+            f"'{new_name}' conflicts with existing command '{conflict_name}' under case-insensitive lookup",
             [],
         )
 
@@ -1340,27 +1367,13 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
         data[new_name] = data.pop(old_name)
 
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            yaml.safe_dump(data, f, sort_keys=False)
-    except OSError as exc:
+        content = yaml.safe_dump(data, sort_keys=False)
+        _atomic_write_text(file_path, content)
+    except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to write source file: {exc}", []
 
-    sync_messages = sync_binaries(load_cmds(find_yamls()))
-    if _report_sync_messages(sync_messages, emit=False):
-        rollback_error = _restore_command_file_snapshot(file_path, original_content)
-        rollback_sync_messages = sync_binaries(load_cmds(find_yamls()))
-
-        if rollback_error:
-            return False, f"wrapper sync failed and rollback failed: {rollback_error}", sync_messages
-        if _report_sync_messages(rollback_sync_messages, emit=False):
-            return (
-                False,
-                "wrapper sync failed and source file was restored, but wrapper rollback failed",
-                [*sync_messages, *rollback_sync_messages],
-            )
-
-        return False, "wrapper sync failed; source file was restored", sync_messages
-
+    sync_db, sync_load_warnings = _load_commands_for_sync()
+    sync_messages = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
     return True, "", sync_messages
 
 
@@ -1369,7 +1382,7 @@ def _is_valid_name(name: str) -> bool:
     return bool(name) and all(c.isalnum() or c in '-_ ' for c in name) and not name.isspace()
 
 
-def _wizard_add(win) -> bool:
+def _wizard_add(win) -> str:
     fields = [
         Field("name", "Command"),
         Field("desc", "Description"),
@@ -1379,7 +1392,7 @@ def _wizard_add(win) -> bool:
     while True:
         res = form_input(win, "Add command", fields)
         if not res:
-            return False
+            return "cancelled"
 
         name = res['name'].strip()
         if not _is_valid_name(name):
@@ -1412,7 +1425,7 @@ def _wizard_add(win) -> bool:
 
         steps = steps_editor(win, [])
         if steps is None:
-            return False
+            return "cancelled"
 
         timeout = res['timeout'].strip()
         steps_key = f"steps {timeout}" if timeout else "steps"
@@ -1427,16 +1440,20 @@ def _wizard_add(win) -> bool:
             continue
 
         target = _preferred_command_file_for_write()
-        sync_messages = save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
-        if _report_sync_messages(sync_messages, emit=False):
+        saved, sync_messages = save_cmd(name, {"description": res['desc'].strip(), steps_key: steps}, target)
+        if not saved:
+            error_message = _first_non_warning_message(sync_messages) or "Failed to save command."
             y = _draw_header(win, "Add command")
-            _addstr(win, y, 4, "Failed to add command due validation or sync errors.", ERR())
+            _addstr(win, y, 4, error_message, ERR())
             _addstr(win, y + 2, 4, f"Target file: {target}", DIM())
             _addstr(win, y + 4, 4, "Press any key to continue.", DIM())
             win.refresh()
             win.getch()
             continue
-        return True
+
+        if _report_sync_messages(sync_messages, emit=False):
+            return "saved_with_sync_issues"
+        return "saved"
 
 
 def _menu_line_for_command(name: str, cfg: Dict[str, Any]) -> str:
@@ -1529,7 +1546,11 @@ def _wizard_edit_command(win, name: str) -> str:
             if steps_key != old_steps_key:
                 cfg[steps_key] = cfg.pop(old_steps_key)
 
-            sync_messages = save_cmd(current_name, cfg, cfg['_source'])
+            saved, sync_messages = save_cmd(current_name, cfg, cfg['_source'])
+            if not saved:
+                status = f"ERR: {_first_non_warning_message(sync_messages) or 'failed to save metadata'}"
+                continue
+
             status = "OK: Metadata updated."
             if _report_sync_messages(sync_messages, emit=False):
                 status = "WARN: Metadata saved with sync issues."
@@ -1540,7 +1561,11 @@ def _wizard_edit_command(win, name: str) -> str:
             steps = steps_editor(win, existing_steps)
             if steps is not None:
                 cfg[old_steps_key] = steps
-                sync_messages = save_cmd(current_name, cfg, cfg['_source'])
+                saved, sync_messages = save_cmd(current_name, cfg, cfg['_source'])
+                if not saved:
+                    status = f"ERR: {_first_non_warning_message(sync_messages) or 'failed to save steps'}"
+                    continue
+
                 status = "OK: Steps updated."
                 if _report_sync_messages(sync_messages, emit=False):
                     status = "WARN: Steps saved with sync issues."
@@ -1572,15 +1597,18 @@ def _wizard_main(win):
     status = ""
     startup_sync_done = False
     while True:
-        db = load_cmds(find_yamls())
+        db_load_warnings: List[str] = []
+        db = load_cmds(find_yamls(), warnings=db_load_warnings)
         if not startup_sync_done:
-            auto_sync_messages = sync_binaries(db)
+            auto_sync_messages = _sync_messages_with_load_warnings(db, db_load_warnings)
             auto_sync_has_errors = _report_sync_messages(auto_sync_messages, emit=False)
             auto_sync_has_warnings = any(msg.startswith("WARN: ") for msg in auto_sync_messages)
 
             if not status:
                 if auto_sync_has_errors:
                     status = "WARN: Automatic wrapper sync had errors."
+                elif db_load_warnings:
+                    status = "WARN: Command-file warnings detected; stale wrapper cleanup is paused."
                 elif auto_sync_has_warnings:
                     status = "WARN: Some naked wrappers are disabled due to command conflicts."
 
@@ -1610,8 +1638,11 @@ def _wizard_main(win):
             break
 
         if choice == 0:
-            if _wizard_add(win):
+            add_result = _wizard_add(win)
+            if add_result == "saved":
                 status = "OK: Command saved."
+            elif add_result == "saved_with_sync_issues":
+                status = "WARN: Command saved, but wrapper sync had errors."
             else:
                 status = "WARN: Add command canceled."
             continue
@@ -2156,11 +2187,15 @@ def cmd_add_yaml(yaml_str: str):
             had_errors = True
             continue
 
-        sync_messages = save_cmd(normalized_name, cfg, target)
+        saved, sync_messages = save_cmd(normalized_name, cfg, target)
+        if not saved:
+            _report_sync_messages(sync_messages)
+            had_errors = True
+            continue
+
         has_sync_errors = _report_sync_messages(sync_messages)
         if has_sync_errors:
             had_errors = True
-            continue
 
         existing_commands[normalized_name] = cfg
         lookup_index[lookup_key] = normalized_name
@@ -2300,7 +2335,8 @@ def _auto_update():
             return_code = _run_pip(update_args)
 
         if return_code == 0:
-            sync_errors = sync_binaries(load_cmds(find_yamls()))
+            sync_db, sync_load_warnings = _load_commands_for_sync()
+            sync_errors = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
             if _report_sync_messages(sync_errors):
                 return_code = 1
             else:
@@ -2361,13 +2397,26 @@ def main():
     resolved_action = _resolve_command_name(action, db, lookup_index)
 
     if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
-        _report_sync_messages(sync_binaries(db, report_conflicts=False))
+        sync_kwargs: Dict[str, Any] = {'report_conflicts': False}
+        if load_warnings:
+            sync_kwargs['prune_stale'] = False
+            _warn("Skipping stale wrapper cleanup because command files have warnings.")
+        _report_sync_messages(sync_binaries(db, **sync_kwargs))
 
     if normalized_action == 'sync':
-        is_uninstall = "--uninstall" in sys.argv
+        sync_args = action_parts[1:]
+        if sync_args not in ([], ["--uninstall"]):
+            _error(f"Usage: {PRIMARY_WRAPPER} sync [--uninstall]")
+            sys.exit(1)
+
+        is_uninstall = sync_args == ["--uninstall"]
         if not is_uninstall:
             _warn("Manual sync is no longer required. Wrappers are synced automatically.")
-        sync_errors = sync_binaries(db, uninstall=is_uninstall)
+        sync_kwargs = {'uninstall': is_uninstall}
+        if load_warnings and not is_uninstall:
+            sync_kwargs['prune_stale'] = False
+            _warn("Skipping stale wrapper cleanup because command files have warnings.")
+        sync_errors = sync_binaries(db, **sync_kwargs)
         if _report_sync_messages(sync_errors):
             sys.exit(1)
         if not is_uninstall:
@@ -2433,11 +2482,12 @@ def main():
             _error(err_message)
             sys.exit(1)
 
+        _ok(f"Removed '{resolved_name}'.")
+
         has_sync_errors = _report_sync_messages(sync_messages)
         if has_sync_errors:
+            _warn(f"Removed '{resolved_name}', but wrapper sync reported errors.")
             sys.exit(1)
-
-        _ok(f"Removed '{resolved_name}'.")
 
     else:
         target = resolved_full_action or resolved_action

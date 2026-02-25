@@ -205,6 +205,69 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(argv, ["commands-wrapper", "add", "my-cmd"])
         self.assertTrue(has_yaml)
 
+    def test_wizard_add_returns_warning_state_when_sync_has_errors(self):
+        with (
+            mock.patch.object(
+                cw,
+                "form_input",
+                return_value={"name": "demo", "desc": "desc", "timeout": ""},
+            ),
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "_find_case_insensitive_conflict", return_value=None),
+            mock.patch.object(
+                cw, "steps_editor", return_value=[{"command": "echo hi"}]
+            ),
+            mock.patch.object(
+                cw,
+                "save_cmd",
+                return_value=(True, ["failed to write wrapper 'x': denied"]),
+            ),
+            mock.patch.object(cw, "_report_sync_messages", return_value=True),
+        ):
+            result = cw._wizard_add(object())
+
+        self.assertEqual(result, "saved_with_sync_issues")
+
+    def test_wizard_add_returns_saved_state_when_sync_is_clean(self):
+        with (
+            mock.patch.object(
+                cw,
+                "form_input",
+                return_value={"name": "demo", "desc": "desc", "timeout": ""},
+            ),
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "_find_case_insensitive_conflict", return_value=None),
+            mock.patch.object(
+                cw, "steps_editor", return_value=[{"command": "echo hi"}]
+            ),
+            mock.patch.object(cw, "save_cmd", return_value=(True, [])),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+        ):
+            result = cw._wizard_add(object())
+
+        self.assertEqual(result, "saved")
+
+    def test_wizard_add_returns_cancelled_when_form_cancelled(self):
+        with mock.patch.object(cw, "form_input", return_value=None):
+            result = cw._wizard_add(object())
+
+        self.assertEqual(result, "cancelled")
+
+    def test_wizard_add_returns_cancelled_when_steps_editor_cancelled(self):
+        with (
+            mock.patch.object(
+                cw,
+                "form_input",
+                return_value={"name": "demo", "desc": "desc", "timeout": ""},
+            ),
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "_find_case_insensitive_conflict", return_value=None),
+            mock.patch.object(cw, "steps_editor", return_value=None),
+        ):
+            result = cw._wizard_add(object())
+
+        self.assertEqual(result, "cancelled")
+
     def test_conflict_warning_avoids_leaking_absolute_paths(self):
         db = {
             "extract": {
@@ -270,6 +333,51 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue(wrapper_path.is_file())
             content = wrapper_path.read_text(encoding="utf-8")
             self.assertTrue(content.startswith("#!/usr/bin/env sh\n"))
+
+    def test_sync_binaries_does_not_prune_generated_wrappers_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            stale_wrapper = target_bin / "stale-wrapper"
+            stale_wrapper.write_text(
+                f"#!/usr/bin/env sh\n# {cw.WRAPPER_MARKER}\nexit 0\n",
+                encoding="utf-8",
+            )
+            stale_wrapper.chmod(0o755)
+
+            messages = cw.sync_binaries(
+                {},
+                bin_dir=str(target_bin),
+                platform_name="posix",
+                report_conflicts=False,
+                prune_stale=False,
+            )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            self.assertTrue(stale_wrapper.exists())
+
+    def test_sync_binaries_prunes_generated_wrappers_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            stale_wrapper = target_bin / "stale-wrapper"
+            stale_wrapper.write_text(
+                f"#!/usr/bin/env sh\n# {cw.WRAPPER_MARKER}\nexit 0\n",
+                encoding="utf-8",
+            )
+            stale_wrapper.chmod(0o755)
+
+            messages = cw.sync_binaries(
+                {},
+                bin_dir=str(target_bin),
+                platform_name="posix",
+                report_conflicts=False,
+            )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            self.assertFalse(stale_wrapper.exists())
 
     def test_sync_binaries_targets_module_file_not_sys_argv(self):
         db = {
@@ -558,6 +666,37 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, 1)
         error_mock.assert_called_once_with("source file not found: /tmp/missing.yaml")
 
+    def test_main_remove_reports_sync_errors_after_removal(self):
+        db = {
+            "foo": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+                "_source": "/tmp/commands.yaml",
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(
+                cw,
+                "remove_from_file",
+                return_value=(True, "", ["failed to write wrapper 'x': denied"]),
+            ),
+            mock.patch.object(cw, "_report_sync_messages", return_value=True),
+            mock.patch.object(cw, "_ok") as ok_mock,
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "remove", "foo"]),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        ok_mock.assert_called_once_with("Removed 'foo'.")
+        warn_mock.assert_called_once_with(
+            "Removed 'foo', but wrapper sync reported errors."
+        )
+
     def test_run_step_press_key_trims_special_key_names(self):
         class DummyProc:
             def __init__(self):
@@ -736,7 +875,7 @@ class CommandsWrapperTests(unittest.TestCase):
             try:
                 os.chdir(work)
                 with mock.patch.dict(os.environ, env, clear=False):
-                    messages = cw.save_cmd(
+                    saved, messages = cw.save_cmd(
                         "oaa",
                         {
                             "description": "lowercase",
@@ -747,8 +886,67 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
+            self.assertFalse(saved)
             self.assertTrue(messages)
             self.assertIn("conflicts with existing command", messages[0])
+
+    def test_save_cmd_allows_unrelated_update_despite_global_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                "Foo:\n"
+                "  description: first\n"
+                "  steps:\n"
+                '    - command: "echo foo"\n'
+                "foo:\n"
+                "  description: colliding\n"
+                "  steps:\n"
+                '    - command: "echo foo2"\n'
+                "Bar:\n"
+                "  description: target\n"
+                "  steps:\n"
+                '    - command: "echo bar"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(cw, "sync_binaries", return_value=[]),
+                ):
+                    saved, messages = cw.save_cmd(
+                        "Bar",
+                        {
+                            "description": "updated",
+                            "steps": [{"command": "echo bar-updated"}],
+                        },
+                        str(commands_file),
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertTrue(saved)
+            self.assertEqual(messages, [])
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("Foo:", content)
+            self.assertIn("foo:", content)
+            self.assertIn("Bar:", content)
+            self.assertIn("description: updated", content)
 
     def test_load_cmds_collects_parse_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -761,6 +959,49 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertEqual(loaded, {})
             self.assertTrue(warnings)
             self.assertIn("failed to parse command file", warnings[0])
+
+    def test_scan_yaml_files_uses_deterministic_sorted_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "zeta.yaml").write_text("# z\n", encoding="utf-8")
+            (directory / "Alpha.yml").write_text("# a\n", encoding="utf-8")
+            (directory / ".hidden.yaml").write_text("# hidden\n", encoding="utf-8")
+            (directory / "notes.txt").write_text("ignore\n", encoding="utf-8")
+
+            files = cw._scan_yaml_files(str(directory))
+
+            self.assertEqual(
+                [Path(path).name for path in files],
+                ["Alpha.yml", "zeta.yaml"],
+            )
+
+    def test_scan_yaml_files_breaks_casefold_ties_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "A.yaml").write_text("# upper\n", encoding="utf-8")
+            (directory / "a.yaml").write_text("# lower\n", encoding="utf-8")
+
+            files = cw._scan_yaml_files(str(directory))
+
+            self.assertEqual([Path(path).name for path in files], ["A.yaml", "a.yaml"])
+
+    def test_sync_messages_with_load_warnings_disables_stale_prune(self):
+        with mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock:
+            messages = cw._sync_messages_with_load_warnings(
+                {},
+                ["failed to parse command file 'x': boom"],
+            )
+
+        sync_mock.assert_called_once_with(
+            {},
+            uninstall=False,
+            report_conflicts=True,
+            prune_stale=False,
+        )
+        self.assertIn("WARN: failed to parse command file", messages[0])
+        self.assertTrue(
+            any("skipped stale wrapper cleanup" in message for message in messages)
+        )
 
     def test_save_cmd_fails_on_invalid_existing_yaml(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -784,7 +1025,7 @@ class CommandsWrapperTests(unittest.TestCase):
             try:
                 os.chdir(work)
                 with mock.patch.dict(os.environ, env, clear=False):
-                    messages = cw.save_cmd(
+                    saved, messages = cw.save_cmd(
                         "safe",
                         {
                             "description": "demo",
@@ -795,6 +1036,7 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
+            self.assertFalse(saved)
             self.assertTrue(messages)
             self.assertIn("failed to parse command file", messages[0])
             self.assertEqual(commands_file.read_text(encoding="utf-8"), "bad: [\n")
@@ -804,7 +1046,7 @@ class CommandsWrapperTests(unittest.TestCase):
             target_file = Path(tmp) / "nested" / "commands.yaml"
 
             with mock.patch.object(cw.os, "makedirs", side_effect=OSError("denied")):
-                messages = cw.save_cmd(
+                saved, messages = cw.save_cmd(
                     "safe",
                     {
                         "description": "demo",
@@ -813,6 +1055,7 @@ class CommandsWrapperTests(unittest.TestCase):
                     str(target_file),
                 )
 
+            self.assertFalse(saved)
             self.assertTrue(messages)
             self.assertIn("failed to create command directory", messages[0])
 
@@ -836,21 +1079,17 @@ class CommandsWrapperTests(unittest.TestCase):
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
             }
-            real_open = open
-
-            def flaky_open(path, mode="r", *args, **kwargs):
-                if str(path) == str(commands_file) and "w" in mode:
-                    raise OSError("disk full")
-                return real_open(path, mode, *args, **kwargs)
 
             prev_cwd = os.getcwd()
             try:
                 os.chdir(work)
                 with (
                     mock.patch.dict(os.environ, env, clear=False),
-                    mock.patch("builtins.open", side_effect=flaky_open),
+                    mock.patch.object(
+                        cw, "_atomic_write_text", side_effect=OSError("disk full")
+                    ),
                 ):
-                    messages = cw.save_cmd(
+                    saved, messages = cw.save_cmd(
                         "Bar",
                         {
                             "description": "second",
@@ -861,10 +1100,11 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
+            self.assertFalse(saved)
             self.assertTrue(messages)
             self.assertIn("failed to write command file", messages[0])
 
-    def test_save_cmd_rolls_back_file_when_sync_fails(self):
+    def test_save_cmd_keeps_file_when_sync_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work = root / "work"
@@ -893,10 +1133,10 @@ class CommandsWrapperTests(unittest.TestCase):
                     mock.patch.object(
                         cw,
                         "sync_binaries",
-                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                        return_value=["failed to write wrapper 'x': denied"],
                     ),
                 ):
-                    messages = cw.save_cmd(
+                    saved, messages = cw.save_cmd(
                         "Bar",
                         {
                             "description": "second",
@@ -907,13 +1147,12 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
+            self.assertTrue(saved)
             self.assertTrue(messages)
-            self.assertIn(
-                "wrapper sync failed; source file was restored", "\n".join(messages)
-            )
+            self.assertIn("failed to write wrapper", "\n".join(messages))
             content = commands_file.read_text(encoding="utf-8")
             self.assertIn("Foo:", content)
-            self.assertNotIn("Bar:", content)
+            self.assertIn("Bar:", content)
 
     def test_cmd_add_yaml_exits_nonzero_on_case_insensitive_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -959,6 +1198,49 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("Foo:", content)
             self.assertNotIn("foo:\n", content)
 
+    def test_cmd_add_yaml_persists_commands_when_sync_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text("", encoding="utf-8")
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(
+                        cw,
+                        "sync_binaries",
+                        return_value=["failed to write wrapper 'x': denied"],
+                    ),
+                    self.assertRaises(SystemExit) as exc,
+                ):
+                    cw.cmd_add_yaml(
+                        "new-cmd:\n"
+                        "  description: synced later\n"
+                        "  steps:\n"
+                        '    - command: "echo hi"\n'
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(exc.exception.code, 1)
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("new-cmd:", content)
+
     def test_rename_in_file_rejects_case_insensitive_conflict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1001,7 +1283,56 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("conflicts with existing command", err_message)
             self.assertEqual(sync_messages, [])
 
-    def test_remove_from_file_rolls_back_on_sync_failure(self):
+    def test_rename_in_file_allows_resolving_existing_global_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                "Foo:\n"
+                "  description: first\n"
+                "  steps:\n"
+                '    - command: "echo foo"\n'
+                "foo:\n"
+                "  description: second\n"
+                "  steps:\n"
+                '    - command: "echo foo2"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.object(cw, "sync_binaries", return_value=[]),
+                ):
+                    renamed, err_message, sync_messages = cw.rename_in_file(
+                        "Foo", "Bar", str(commands_file)
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertTrue(renamed)
+            self.assertEqual(err_message, "")
+            self.assertEqual(sync_messages, [])
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertNotIn("Foo:", content)
+            self.assertIn("Bar:", content)
+            self.assertIn("foo:", content)
+
+    def test_remove_from_file_keeps_changes_on_sync_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work = root / "work"
@@ -1030,7 +1361,7 @@ class CommandsWrapperTests(unittest.TestCase):
                     mock.patch.object(
                         cw,
                         "sync_binaries",
-                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                        return_value=["failed to write wrapper 'x': denied"],
                     ),
                 ):
                     removed, err_message, sync_messages = cw.remove_from_file(
@@ -1039,13 +1370,13 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
-            self.assertFalse(removed)
-            self.assertIn("source file was restored", err_message)
+            self.assertTrue(removed)
+            self.assertEqual(err_message, "")
             self.assertTrue(sync_messages)
             content = commands_file.read_text(encoding="utf-8")
-            self.assertIn("Foo:", content)
+            self.assertNotIn("Foo:", content)
 
-    def test_rename_in_file_rolls_back_on_sync_failure(self):
+    def test_rename_in_file_keeps_changes_on_sync_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             work = root / "work"
@@ -1074,7 +1405,7 @@ class CommandsWrapperTests(unittest.TestCase):
                     mock.patch.object(
                         cw,
                         "sync_binaries",
-                        side_effect=[["failed to write wrapper 'x': denied"], []],
+                        return_value=["failed to write wrapper 'x': denied"],
                     ),
                 ):
                     renamed, err_message, sync_messages = cw.rename_in_file(
@@ -1083,12 +1414,12 @@ class CommandsWrapperTests(unittest.TestCase):
             finally:
                 os.chdir(prev_cwd)
 
-            self.assertFalse(renamed)
-            self.assertIn("source file was restored", err_message)
+            self.assertTrue(renamed)
+            self.assertEqual(err_message, "")
             self.assertTrue(sync_messages)
             content = commands_file.read_text(encoding="utf-8")
-            self.assertIn("Foo:", content)
-            self.assertNotIn("Bar:", content)
+            self.assertNotIn("Foo:", content)
+            self.assertIn("Bar:", content)
 
     def test_main_list_uses_non_conflict_sync_path(self):
         with (
@@ -1101,6 +1432,36 @@ class CommandsWrapperTests(unittest.TestCase):
             cw.main()
 
         sync_mock.assert_called_once_with({}, report_conflicts=False)
+        list_mock.assert_called_once_with({})
+
+    def test_main_list_disables_stale_prune_when_load_has_warnings(self):
+        def load_cmds_with_warning(_files, warnings=None):
+            if warnings is not None:
+                warnings.append("failed to parse command file '/tmp/bad.yaml': boom")
+            return {}
+
+        with (
+            mock.patch.object(cw, "load_cmds", side_effect=load_cmds_with_warning),
+            mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock,
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "print_list") as list_mock,
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "list"]),
+        ):
+            cw.main()
+
+        sync_mock.assert_called_once_with(
+            {},
+            report_conflicts=False,
+            prune_stale=False,
+        )
+        self.assertTrue(
+            any(
+                "Skipping stale wrapper cleanup because command files have warnings."
+                in call.args[0]
+                for call in warn_mock.call_args_list
+            )
+        )
         list_mock.assert_called_once_with({})
 
     def test_main_command_execution_suppresses_wrapper_conflict_warnings(self):
@@ -1215,6 +1576,74 @@ class CommandsWrapperTests(unittest.TestCase):
 
         exec_mock.assert_not_called()
         sync_mock.assert_called_once_with(db, uninstall=True)
+
+    def test_main_sync_disables_stale_prune_when_load_has_warnings(self):
+        def load_cmds_with_warning(_files, warnings=None):
+            if warnings is not None:
+                warnings.append("failed to parse command file '/tmp/bad.yaml': boom")
+            return {}
+
+        with (
+            mock.patch.object(cw, "load_cmds", side_effect=load_cmds_with_warning),
+            mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock,
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "sync"]),
+        ):
+            cw.main()
+
+        sync_mock.assert_called_once_with({}, uninstall=False, prune_stale=False)
+        self.assertTrue(
+            any(
+                "Skipping stale wrapper cleanup because command files have warnings."
+                in call.args[0]
+                for call in warn_mock.call_args_list
+            )
+        )
+
+    def test_main_sync_uninstall_keeps_default_prune_with_load_warnings(self):
+        def load_cmds_with_warning(_files, warnings=None):
+            if warnings is not None:
+                warnings.append("failed to parse command file '/tmp/bad.yaml': boom")
+            return {}
+
+        with (
+            mock.patch.object(cw, "load_cmds", side_effect=load_cmds_with_warning),
+            mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock,
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "sync", "--uninstall"]),
+        ):
+            cw.main()
+
+        sync_mock.assert_called_once_with({}, uninstall=True)
+        self.assertFalse(
+            any(
+                "Skipping stale wrapper cleanup because command files have warnings."
+                in call.args[0]
+                for call in warn_mock.call_args_list
+            )
+        )
+
+    def test_main_sync_rejects_unexpected_args(self):
+        with (
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "sync_binaries") as sync_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(
+                sys,
+                "argv",
+                ["commands-wrapper", "sync", "unexpected", "--uninstall"],
+            ),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        sync_mock.assert_not_called()
+        error_mock.assert_called_once_with(
+            f"Usage: {cw.PRIMARY_WRAPPER} sync [--uninstall]"
+        )
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_install_sh_local_source_does_not_require_curl_or_tar(self):
