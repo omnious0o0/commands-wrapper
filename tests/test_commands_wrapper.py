@@ -985,6 +985,73 @@ class CommandsWrapperTests(unittest.TestCase):
 
             self.assertEqual([Path(path).name for path in files], ["A.yaml", "a.yaml"])
 
+    def test_preferred_command_file_for_write_defaults_to_global_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            local_file = work / "commands.yaml"
+            local_file.write_text("# local\n", encoding="utf-8")
+
+            global_dir = xdg / "commands-wrapper"
+            global_dir.mkdir(parents=True)
+            global_file = global_dir / "commands.yaml"
+            global_file.write_text("# global\n", encoding="utf-8")
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    target = cw._preferred_command_file_for_write()
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(target, str(global_file))
+
+    def test_preferred_command_file_for_write_can_opt_in_to_local_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            local_file = work / "commands.yaml"
+            local_file.write_text("# local\n", encoding="utf-8")
+
+            global_dir = xdg / "commands-wrapper"
+            global_dir.mkdir(parents=True)
+            global_file = global_dir / "commands.yaml"
+            global_file.write_text("# global\n", encoding="utf-8")
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+                "COMMANDS_WRAPPER_PREFER_LOCAL_WRITE": "1",
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    target = cw._preferred_command_file_for_write()
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(target, str(local_file))
+
     def test_sync_messages_with_load_warnings_disables_stale_prune(self):
         with mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock:
             messages = cw._sync_messages_with_load_warnings(
@@ -1002,6 +1069,22 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertTrue(
             any("skipped stale wrapper cleanup" in message for message in messages)
         )
+
+    def test_sync_messages_can_disable_stale_prune_without_load_warnings(self):
+        with mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock:
+            messages = cw._sync_messages_with_load_warnings(
+                {},
+                [],
+                prune_stale=False,
+            )
+
+        sync_mock.assert_called_once_with(
+            {},
+            uninstall=False,
+            report_conflicts=True,
+            prune_stale=False,
+        )
+        self.assertEqual(messages, [])
 
     def test_save_cmd_fails_on_invalid_existing_yaml(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1134,7 +1217,7 @@ class CommandsWrapperTests(unittest.TestCase):
                         cw,
                         "sync_binaries",
                         return_value=["failed to write wrapper 'x': denied"],
-                    ),
+                    ) as sync_mock,
                 ):
                     saved, messages = cw.save_cmd(
                         "Bar",
@@ -1150,6 +1233,12 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue(saved)
             self.assertTrue(messages)
             self.assertIn("failed to write wrapper", "\n".join(messages))
+            sync_mock.assert_called_once_with(
+                mock.ANY,
+                uninstall=False,
+                report_conflicts=True,
+                prune_stale=False,
+            )
             content = commands_file.read_text(encoding="utf-8")
             self.assertIn("Foo:", content)
             self.assertIn("Bar:", content)
@@ -1215,6 +1304,7 @@ class CommandsWrapperTests(unittest.TestCase):
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(xdg),
             }
+            target_file = commands_file
 
             prev_cwd = os.getcwd()
             try:
@@ -1228,6 +1318,7 @@ class CommandsWrapperTests(unittest.TestCase):
                     ),
                     self.assertRaises(SystemExit) as exc,
                 ):
+                    target_file = Path(cw._preferred_command_file_for_write())
                     cw.cmd_add_yaml(
                         "new-cmd:\n"
                         "  description: synced later\n"
@@ -1238,7 +1329,8 @@ class CommandsWrapperTests(unittest.TestCase):
                 os.chdir(prev_cwd)
 
             self.assertEqual(exc.exception.code, 1)
-            content = commands_file.read_text(encoding="utf-8")
+            self.assertTrue(target_file.exists())
+            content = target_file.read_text(encoding="utf-8")
             self.assertIn("new-cmd:", content)
 
     def test_rename_in_file_rejects_case_insensitive_conflict(self):
@@ -1362,7 +1454,7 @@ class CommandsWrapperTests(unittest.TestCase):
                         cw,
                         "sync_binaries",
                         return_value=["failed to write wrapper 'x': denied"],
-                    ),
+                    ) as sync_mock,
                 ):
                     removed, err_message, sync_messages = cw.remove_from_file(
                         "Foo", str(commands_file)
@@ -1373,6 +1465,12 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue(removed)
             self.assertEqual(err_message, "")
             self.assertTrue(sync_messages)
+            sync_mock.assert_called_once_with(
+                mock.ANY,
+                uninstall=False,
+                report_conflicts=True,
+                prune_stale=False,
+            )
             content = commands_file.read_text(encoding="utf-8")
             self.assertNotIn("Foo:", content)
 
@@ -1406,7 +1504,7 @@ class CommandsWrapperTests(unittest.TestCase):
                         cw,
                         "sync_binaries",
                         return_value=["failed to write wrapper 'x': denied"],
-                    ),
+                    ) as sync_mock,
                 ):
                     renamed, err_message, sync_messages = cw.rename_in_file(
                         "Foo", "Bar", str(commands_file)
@@ -1417,6 +1515,12 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertTrue(renamed)
             self.assertEqual(err_message, "")
             self.assertTrue(sync_messages)
+            sync_mock.assert_called_once_with(
+                mock.ANY,
+                uninstall=False,
+                report_conflicts=True,
+                prune_stale=False,
+            )
             content = commands_file.read_text(encoding="utf-8")
             self.assertNotIn("Foo:", content)
             self.assertIn("Bar:", content)
@@ -1431,7 +1535,11 @@ class CommandsWrapperTests(unittest.TestCase):
         ):
             cw.main()
 
-        sync_mock.assert_called_once_with({}, report_conflicts=False)
+        sync_mock.assert_called_once_with(
+            {},
+            report_conflicts=False,
+            prune_stale=False,
+        )
         list_mock.assert_called_once_with({})
 
     def test_main_list_disables_stale_prune_when_load_has_warnings(self):

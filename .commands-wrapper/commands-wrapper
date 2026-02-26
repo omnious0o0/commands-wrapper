@@ -113,12 +113,20 @@ def _command_file_candidates(root: str) -> List[str]:
     return [os.path.join(root, 'commands.yaml'), os.path.join(root, 'commands.yml')]
 
 
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, '').strip().casefold()
+    return value in {'1', 'true', 'yes', 'on'}
+
+
 def _preferred_command_file_for_write() -> str:
     cwd = os.getcwd()
+    local_candidates = _command_file_candidates(cwd)
+    prefer_local_write = _env_flag_enabled('COMMANDS_WRAPPER_PREFER_LOCAL_WRITE')
 
-    for candidate in _command_file_candidates(cwd):
-        if os.path.isfile(candidate):
-            return candidate
+    if prefer_local_write:
+        for candidate in local_candidates:
+            if os.path.isfile(candidate):
+                return candidate
 
     global_candidates = [
         *_command_file_candidates(_user_config_dir()),
@@ -128,6 +136,9 @@ def _preferred_command_file_for_write() -> str:
     for candidate in global_candidates:
         if os.path.isfile(candidate):
             return candidate
+
+    if prefer_local_write:
+        return local_candidates[0]
 
     return global_candidates[0]
 
@@ -821,15 +832,19 @@ def _sync_messages_with_load_warnings(
     *,
     uninstall: bool = False,
     report_conflicts: bool = True,
+    prune_stale: bool = True,
 ) -> List[str]:
     messages = [f"WARN: {warning}" for warning in load_warnings]
+    should_prune_stale = prune_stale
     sync_kwargs: Dict[str, Any] = {
         'uninstall': uninstall,
         'report_conflicts': report_conflicts,
     }
     if load_warnings:
-        sync_kwargs['prune_stale'] = False
+        should_prune_stale = False
         messages.append("WARN: skipped stale wrapper cleanup due to command-file load warnings")
+
+    sync_kwargs['prune_stale'] = should_prune_stale
 
     messages.extend(sync_binaries(db, **sync_kwargs))
     return messages
@@ -1308,7 +1323,11 @@ def save_cmd(name: str, cfg: Dict[str, Any], file_path: str) -> Tuple[bool, List
         return False, [f"failed to write command file '{file_path}': {exc}"]
 
     sync_db, sync_load_warnings = _load_commands_for_sync()
-    return True, _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
+    return True, _sync_messages_with_load_warnings(
+        sync_db,
+        sync_load_warnings,
+        prune_stale=False,
+    )
 
 
 def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
@@ -1327,7 +1346,11 @@ def remove_from_file(name: str, file_path: str) -> Tuple[bool, str, List[str]]:
         _atomic_write_text(file_path, content)
 
         sync_db, sync_load_warnings = _load_commands_for_sync()
-        sync_messages = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
+        sync_messages = _sync_messages_with_load_warnings(
+            sync_db,
+            sync_load_warnings,
+            prune_stale=False,
+        )
         return True, "", sync_messages
     except (OSError, yaml.YAMLError) as exc:
         return False, f"failed to update source file: {exc}", []
@@ -1373,7 +1396,11 @@ def rename_in_file(old_name: str, new_name: str, file_path: str) -> Tuple[bool, 
         return False, f"failed to write source file: {exc}", []
 
     sync_db, sync_load_warnings = _load_commands_for_sync()
-    sync_messages = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
+    sync_messages = _sync_messages_with_load_warnings(
+        sync_db,
+        sync_load_warnings,
+        prune_stale=False,
+    )
     return True, "", sync_messages
 
 
@@ -1600,7 +1627,11 @@ def _wizard_main(win):
         db_load_warnings: List[str] = []
         db = load_cmds(find_yamls(), warnings=db_load_warnings)
         if not startup_sync_done:
-            auto_sync_messages = _sync_messages_with_load_warnings(db, db_load_warnings)
+            auto_sync_messages = _sync_messages_with_load_warnings(
+                db,
+                db_load_warnings,
+                prune_stale=False,
+            )
             auto_sync_has_errors = _report_sync_messages(auto_sync_messages, emit=False)
             auto_sync_has_warnings = any(msg.startswith("WARN: ") for msg in auto_sync_messages)
 
@@ -2336,7 +2367,11 @@ def _auto_update():
 
         if return_code == 0:
             sync_db, sync_load_warnings = _load_commands_for_sync()
-            sync_errors = _sync_messages_with_load_warnings(sync_db, sync_load_warnings)
+            sync_errors = _sync_messages_with_load_warnings(
+                sync_db,
+                sync_load_warnings,
+                prune_stale=False,
+            )
             if _report_sync_messages(sync_errors):
                 return_code = 1
             else:
@@ -2397,9 +2432,11 @@ def main():
     resolved_action = _resolve_command_name(action, db, lookup_index)
 
     if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
-        sync_kwargs: Dict[str, Any] = {'report_conflicts': False}
+        sync_kwargs: Dict[str, Any] = {
+            'report_conflicts': False,
+            'prune_stale': False,
+        }
         if load_warnings:
-            sync_kwargs['prune_stale'] = False
             _warn("Skipping stale wrapper cleanup because command files have warnings.")
         _report_sync_messages(sync_binaries(db, **sync_kwargs))
 
