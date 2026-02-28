@@ -95,10 +95,10 @@ command-name:
 - `- command: "cd /some/path"` updates the working directory for following steps.
 - Running `commands-wrapper <name>` directly still opens an interactive shell for
   single-`cd` wrappers.
-- Running generated wrapper executables stores the `cd` target for the next wrapper
-  command in the same shell process, so chains like `oc && dev` work without token loss.
+- Running generated wrapper executables for single-`cd` commands requires hook
+  initialization in your shell.
 - With `eval "$(commands-wrapper hook)"` enabled, single-`cd` wrappers change the
-  current shell directory directly.
+  current shell directory directly and chains like `oc && dev` work in one shell.
 
 Example:
 
