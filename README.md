@@ -76,6 +76,8 @@ When command names overlap, local project definitions take precedence over user/
 
 New commands are written to your user config path by default so they persist across directories and restarts.
 Set `COMMANDS_WRAPPER_PREFER_LOCAL_WRITE=1` if you want new commands to target the current directory config file first.
+By default, local commands discovered in the current directory are promoted to your user config so they stay available outside that directory.
+Set `COMMANDS_WRAPPER_AUTO_PROMOTE_LOCAL=0` to disable that promotion behavior.
 
 ### YAML format
 
