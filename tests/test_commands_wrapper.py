@@ -408,6 +408,11 @@ class CommandsWrapperTests(unittest.TestCase):
             expected_target = cw.shlex.quote(os.path.realpath(str(module_path)))
             self.assertIn(f'exec {expected_target} "$@"', content)
 
+            wrapper_upper_path = target_bin / cw.SHORT_ALIAS.upper()
+            self.assertTrue(wrapper_upper_path.is_file())
+            wrapper_upper_content = wrapper_upper_path.read_text(encoding="utf-8")
+            self.assertIn(f'exec {expected_target} "$@"', wrapper_upper_content)
+
     def test_sync_binaries_writes_original_case_wrapper_alias(self):
         db = {
             "OAA": {
@@ -2776,10 +2781,12 @@ class CommandsWrapperTests(unittest.TestCase):
             fake_bin = root / "fake-bin"
             fake_home = root / "home"
             fake_xdg = root / "xdg"
+            fake_user_base = root / "py-user-base"
             work = root / "work"
             fake_bin.mkdir(parents=True)
             fake_home.mkdir(parents=True)
             fake_xdg.mkdir(parents=True)
+            fake_user_base.mkdir(parents=True)
             work.mkdir(parents=True)
 
             config_dir = fake_xdg / "commands-wrapper"
@@ -2808,7 +2815,8 @@ class CommandsWrapperTests(unittest.TestCase):
             env = os.environ.copy()
             env["HOME"] = str(fake_home)
             env["XDG_CONFIG_HOME"] = str(fake_xdg)
-            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+            env["PYTHONUSERBASE"] = str(fake_user_base)
+            env["PATH"] = f"{fake_bin}:{fake_user_base}/bin:/usr/bin:/bin"
 
             command = f"cd {shlex.quote(str(root))}; oc"
             result = subprocess.run(
@@ -2940,6 +2948,64 @@ class CommandsWrapperTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertEqual(result.stdout.strip().splitlines()[-1], str(target))
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_uppercase_short_alias_executes_main_wrapper_integration(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            fake_user_base = root / "py-user-base"
+            work = root / "work"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            fake_user_base.mkdir(parents=True)
+            work.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            (config_dir / "commands.yaml").write_text(
+                "dev:\n"
+                "  description: npm run dev\n"
+                "  steps:\n"
+                '    - command: "echo dev"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PYTHONUSERBASE"] = str(fake_user_base)
+            env["PATH"] = f"{fake_bin}:{fake_user_base}/bin:/usr/bin:/bin"
+
+            command = (
+                "set -e; "
+                f"cd {shlex.quote(str(work))}; "
+                "commands-wrapper list >/dev/null; "
+                "command -v CW >/dev/null; "
+                "CW list"
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("commands-wrapper", result.stdout)
+            self.assertIn("dev", result.stdout)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_local_commands_are_promoted_for_cross_directory_listing_integration(self):

@@ -1200,13 +1200,6 @@ def _wrapper_upper_alias(wrapper_name: str) -> Optional[str]:
     if uppercase_alias == wrapper_name:
         return None
 
-    if uppercase_alias.casefold() in (
-        SHORT_ALIAS.casefold(),
-        LEGACY_ALIAS.casefold(),
-        PRIMARY_WRAPPER.casefold(),
-    ):
-        return None
-
     return uppercase_alias
 
 
@@ -1650,6 +1643,17 @@ def sync_binaries(
             LEGACY_ALIAS: None,
         }
         wrapper_targets.update(custom_wrappers)
+
+        expanded_wrapper_targets: Dict[str, Optional[str]] = {}
+        for wrapper_name, command_name in wrapper_targets.items():
+            if wrapper_name not in expanded_wrapper_targets:
+                expanded_wrapper_targets[wrapper_name] = command_name
+
+            uppercase_alias = _wrapper_upper_alias(wrapper_name)
+            if uppercase_alias and uppercase_alias not in expanded_wrapper_targets:
+                expanded_wrapper_targets[uppercase_alias] = command_name
+
+        wrapper_targets = expanded_wrapper_targets
 
     expected_commands = set(wrapper_targets.keys())
 
