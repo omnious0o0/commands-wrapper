@@ -483,6 +483,9 @@ class CommandsWrapperTests(unittest.TestCase):
             wrapper_content = (target_bin / "oc").read_text(encoding="utf-8")
             self.assertIn("COMMANDS_WRAPPER_WRAPPER_ENTRY=1", wrapper_content)
             self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=oc", wrapper_content)
+            wrapper_upper_content = (target_bin / "OC").read_text(encoding="utf-8")
+            self.assertIn("COMMANDS_WRAPPER_WRAPPER_ENTRY=1", wrapper_upper_content)
+            self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=OC", wrapper_upper_content)
 
     def test_sync_binaries_skips_primary_wrapper_name(self):
         db = {
@@ -533,6 +536,20 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(wrappers.get("oaa"), "OAA")
         self.assertEqual(wrappers.get("OAA"), "OAA")
+
+    def test_build_wrapper_map_adds_uppercase_alias_for_lowercase_command(self):
+        wrappers, errors = cw._build_wrapper_map(
+            {
+                "oc": {
+                    "description": "demo",
+                    "steps": [{"command": "echo hi"}],
+                }
+            }
+        )
+
+        self.assertFalse(errors)
+        self.assertEqual(wrappers.get("oc"), "oc")
+        self.assertEqual(wrappers.get("OC"), "oc")
 
     def test_build_wrapper_map_adds_namespace_wrapper_for_multi_word_command(self):
         wrappers, errors = cw._build_wrapper_map(
@@ -2854,6 +2871,63 @@ class CommandsWrapperTests(unittest.TestCase):
                 'eval "$(commands-wrapper hook)"; '
                 "type bais >/dev/null; "
                 "bais; "
+                "pwd"
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], str(target))
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_uppercase_wrapper_alias_changes_directory_with_hook_integration(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            start = root / "start"
+            target = root / "target"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            start.mkdir(parents=True)
+            target.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            (config_dir / "commands.yaml").write_text(
+                "oc:\n"
+                "  description: cd omni-connector\n"
+                "  steps:\n"
+                f'    - command: "cd {target}"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            command = (
+                "set -e; "
+                f"cd {shlex.quote(str(start))}; "
+                'eval "$(commands-wrapper hook)"; '
+                "type OC >/dev/null; "
+                "OC; "
                 "pwd"
             )
             result = subprocess.run(

@@ -1192,6 +1192,24 @@ def _wrapper_alias_from_command_name(command_name: str) -> Optional[str]:
     return wrapper_alias
 
 
+def _wrapper_upper_alias(wrapper_name: str) -> Optional[str]:
+    if not wrapper_name:
+        return None
+
+    uppercase_alias = wrapper_name.upper()
+    if uppercase_alias == wrapper_name:
+        return None
+
+    if uppercase_alias.casefold() in (
+        SHORT_ALIAS.casefold(),
+        LEGACY_ALIAS.casefold(),
+        PRIMARY_WRAPPER.casefold(),
+    ):
+        return None
+
+    return uppercase_alias
+
+
 def _namespace_prefix_from_command_name(command_name: str) -> Optional[str]:
     normalized = str(command_name).strip()
     if not normalized:
@@ -1296,6 +1314,10 @@ def _build_wrapper_map(db: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
             if candidate in seen_targets:
                 continue
             seen_targets[candidate] = target_command
+
+            uppercase_alias = _wrapper_upper_alias(candidate)
+            if uppercase_alias and uppercase_alias not in seen_targets:
+                seen_targets[uppercase_alias] = target_command
 
         for candidate, target_command in seen_targets.items():
             previous = wrappers.get(candidate)
