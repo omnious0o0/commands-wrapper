@@ -108,6 +108,7 @@ system --update:
 ```
 
 Avoid storing secrets (passwords, tokens, keys) in command YAML files. Prefer interactive prompts or environment-based secrets.
+Set `COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT=1` to redact likely secret values from printed command previews and command-failure messages.
 
 ## Commands
 
