@@ -2152,6 +2152,39 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn('oc() { __commands_wrapper_dispatch oc "$@"; }', printed_lines)
         self.assertIn("alias claw-doc=\"commands-wrapper 'claw doc'\"", printed_lines)
 
+    @unittest.skipIf(os.name == "nt", "POSIX hook output only")
+    def test_main_hook_suppresses_warning_level_wrapper_conflicts(self):
+        wrappers = {
+            "oc": "oc",
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(
+                cw,
+                "_build_wrapper_map_with_conflicts",
+                return_value=(
+                    wrappers,
+                    [
+                        "WARN: skipped naked wrapper 'extract' for command 'extract' because that name is already used by another executable on PATH."
+                    ],
+                    {},
+                ),
+            ),
+            mock.patch.object(cw, "_warn") as warn_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "hook"]),
+        ):
+            cw.main()
+
+        warn_mock.assert_not_called()
+        error_mock.assert_not_called()
+        printed_lines = [call.args[0] for call in print_mock.call_args_list]
+        self.assertIn('oc() { __commands_wrapper_dispatch oc "$@"; }', printed_lines)
+
     def test_main_command_execution_suppresses_wrapper_conflict_warnings(self):
         db = {
             "cc": {

@@ -3032,7 +3032,13 @@ def main():
         _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} hook")
         target_dir = _script_bin_dir(os.name)
         wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir)
-        _report_sync_messages(wrapper_errors)
+        fatal_hook_errors = [
+            message for message in wrapper_errors if not message.startswith("WARN: ")
+        ]
+        if fatal_hook_errors:
+            for message in fatal_hook_errors:
+                _error(message)
+            sys.exit(1)
         if os.name == 'nt':
             print(f'doskey {SHORT_ALIAS}={PRIMARY_WRAPPER} $*')
             print(f'doskey {LEGACY_ALIAS}={PRIMARY_WRAPPER} $*')
