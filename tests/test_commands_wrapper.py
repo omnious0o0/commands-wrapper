@@ -1347,6 +1347,103 @@ class CommandsWrapperTests(unittest.TestCase):
 
             self.assertEqual(target, str(local_file))
 
+    def test_promote_local_commands_to_global_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            local_file = work / "commands.yaml"
+            local_file.write_text(
+                "bais:\n"
+                "  description: cd better ai studio\n"
+                "  steps:\n"
+                '    - command: "cd /tmp"\n',
+                encoding="utf-8",
+            )
+
+            global_dir = xdg / "commands-wrapper"
+            global_dir.mkdir(parents=True)
+            global_file = global_dir / "commands.yaml"
+            global_file.write_text(
+                "dev:\n"
+                "  description: npm run dev\n"
+                "  steps:\n"
+                '    - command: "npm run dev"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    promoted = cw._promote_local_commands_to_global(cw.find_yamls())
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(promoted, ["bais"])
+            content = global_file.read_text(encoding="utf-8")
+            self.assertIn("dev:", content)
+            self.assertIn("bais:", content)
+
+    def test_promote_local_commands_to_global_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            local_file = work / "commands.yaml"
+            local_file.write_text(
+                "bais:\n"
+                "  description: cd better ai studio\n"
+                "  steps:\n"
+                '    - command: "cd /tmp"\n',
+                encoding="utf-8",
+            )
+
+            global_dir = xdg / "commands-wrapper"
+            global_dir.mkdir(parents=True)
+            global_file = global_dir / "commands.yaml"
+            global_file.write_text(
+                "dev:\n"
+                "  description: npm run dev\n"
+                "  steps:\n"
+                '    - command: "npm run dev"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+                cw.AUTO_PROMOTE_LOCAL_COMMANDS_ENV: "0",
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with mock.patch.dict(os.environ, env, clear=False):
+                    promoted = cw._promote_local_commands_to_global(cw.find_yamls())
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(promoted, [])
+            content = global_file.read_text(encoding="utf-8")
+            self.assertIn("dev:", content)
+            self.assertNotIn("bais:", content)
+
     def test_sync_messages_with_load_warnings_disables_stale_prune(self):
         with mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock:
             messages = cw._sync_messages_with_load_warnings(

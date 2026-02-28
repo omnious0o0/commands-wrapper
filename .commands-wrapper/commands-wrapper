@@ -121,6 +121,7 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 COMMAND_OUTPUT_REDACTION_ENV = 'COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT'
+AUTO_PROMOTE_LOCAL_COMMANDS_ENV = 'COMMANDS_WRAPPER_AUTO_PROMOTE_LOCAL'
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b((?:api[_-]?key|token|secret|password|passwd|pwd|authorization|auth)[\w-]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
 )
@@ -152,6 +153,151 @@ def _display_command_text(command_text: str) -> str:
     if _env_flag_enabled(COMMAND_OUTPUT_REDACTION_ENV):
         return _redact_command_text(command_text)
     return command_text
+
+
+def _auto_promote_local_commands_enabled() -> bool:
+    configured_value = os.environ.get(AUTO_PROMOTE_LOCAL_COMMANDS_ENV, '').strip()
+    if configured_value == '':
+        return True
+    return _env_flag_enabled(AUTO_PROMOTE_LOCAL_COMMANDS_ENV)
+
+
+def _global_command_file_candidates() -> List[str]:
+    return [
+        *_command_file_candidates(_user_config_dir()),
+        *_command_file_candidates(_legacy_config_dir()),
+    ]
+
+
+def _preferred_global_command_file_for_write() -> str:
+    candidates = _global_command_file_candidates()
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return False
+
+    try:
+        return os.path.commonpath([real_path, real_root]) == real_root
+    except ValueError:
+        return False
+
+
+def _valid_commands_from_mapping(data: Dict[str, Any], source: str) -> Dict[str, Dict[str, Any]]:
+    commands: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_cfg in data.items():
+        if not isinstance(raw_cfg, dict):
+            continue
+
+        steps_key = _get_steps_key(raw_cfg)
+        if not steps_key:
+            continue
+        if not isinstance(raw_cfg.get(steps_key), list):
+            continue
+
+        normalized_name = str(raw_name).strip()
+        if not normalized_name:
+            continue
+
+        cfg = dict(raw_cfg)
+        cfg['_source'] = source
+        commands[normalized_name] = cfg
+
+    return commands
+
+
+def _promote_local_commands_to_global(files: List[str]) -> List[str]:
+    if not _auto_promote_local_commands_enabled() or not files:
+        return []
+
+    cwd = os.getcwd()
+    cwd_real = os.path.realpath(cwd)
+    if cwd_real in (os.path.realpath(_user_config_dir()), os.path.realpath(_legacy_config_dir())):
+        return []
+
+    local_candidate_files = {
+        os.path.realpath(os.path.join(cwd, 'commands.yaml')),
+        os.path.realpath(os.path.join(cwd, 'commands.yml')),
+    }
+    local_candidate_dirs = [
+        os.path.realpath(os.path.join(cwd, '.commands-wrapper')),
+        os.path.realpath(os.path.join(cwd, 'commands-wrapper')),
+    ]
+
+    local_files: List[str] = []
+    for file_path in files:
+        real_file = os.path.realpath(file_path)
+        if real_file in local_candidate_files:
+            local_files.append(file_path)
+            continue
+        if any(_path_is_within(real_file, local_root) for local_root in local_candidate_dirs):
+            local_files.append(file_path)
+
+    if not local_files:
+        return []
+
+    local_commands = load_cmds(local_files)
+    if not local_commands:
+        return []
+
+    global_file = _preferred_global_command_file_for_write()
+    global_data: Dict[str, Any] = {}
+    if os.path.exists(global_file):
+        try:
+            with open(global_file, encoding='utf-8') as fd:
+                loaded = yaml.safe_load(fd)
+            if isinstance(loaded, dict):
+                global_data = loaded
+        except (OSError, yaml.YAMLError):
+            return []
+
+    global_commands = _valid_commands_from_mapping(global_data, global_file)
+    lookup_index, lookup_errors = _build_command_lookup_index(global_commands)
+    if lookup_errors:
+        return []
+
+    promoted: List[str] = []
+    for name, cfg in sorted(local_commands.items()):
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            continue
+
+        if normalized_name in global_data:
+            continue
+
+        lookup_key = _command_lookup_key(normalized_name)
+        if lookup_key in lookup_index:
+            continue
+
+        clean_cfg = {key: value for key, value in cfg.items() if key != '_source'}
+        global_data[normalized_name] = clean_cfg
+        lookup_index[lookup_key] = normalized_name
+        promoted.append(normalized_name)
+
+    if not promoted:
+        return []
+
+    parent = os.path.dirname(global_file)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return []
+
+    try:
+        content = yaml.safe_dump(global_data, sort_keys=False)
+        _atomic_write_text(global_file, content)
+    except (OSError, yaml.YAMLError):
+        return []
+
+    return promoted
 
 
 def _preferred_command_file_for_write() -> str:
@@ -2751,8 +2897,19 @@ def main():
         and os.environ.get('COMMANDS_WRAPPER_INTERNAL', '').strip() == '1'
     )
 
+    command_files = find_yamls()
+    promoted_local_commands = _promote_local_commands_to_global(command_files)
+    if promoted_local_commands:
+        command_files = find_yamls()
+
     load_warnings: List[str] = []
-    db = load_cmds(find_yamls(), warnings=load_warnings)
+    db = load_cmds(command_files, warnings=load_warnings)
+    if promoted_local_commands:
+        _warn(
+            "Promoted "
+            f"{len(promoted_local_commands)} local command(s) to global config for cross-directory use. "
+            f"Set {AUTO_PROMOTE_LOCAL_COMMANDS_ENV}=0 to disable."
+        )
     for warning in load_warnings:
         _warn(warning)
     lookup_index, lookup_errors = _build_command_lookup_index(db)
