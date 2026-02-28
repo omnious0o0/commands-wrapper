@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import shlex
 from pathlib import Path
 import shutil
 import stat
@@ -2707,6 +2708,194 @@ class CommandsWrapperTests(unittest.TestCase):
                 "Installed, but wrapper sync needs a new shell session.",
                 result.stdout,
             )
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_single_cd_wrapper_binary_requires_hook_integration(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            work = root / "work"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            work.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            (config_dir / "commands.yaml").write_text(
+                "oc:\n"
+                "  description: cd omni-connector\n"
+                "  steps:\n"
+                f'    - command: "cd {work}"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+            _write_executable(
+                fake_bin / "oc",
+                (
+                    "#!/bin/sh\n"
+                    "COMMANDS_WRAPPER_WRAPPER_ENTRY=1 COMMANDS_WRAPPER_WRAPPER_NAME=oc "
+                    f'exec "{sys.executable}" "{SCRIPT_PATH}" oc "$@"\n'
+                ),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            command = f"cd {shlex.quote(str(root))}; oc"
+            result = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn(
+                "single-directory wrappers require shell hook initialization",
+                result.stdout,
+            )
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_shell_hook_changes_directory_for_single_cd_wrapper_integration(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            start = root / "start"
+            target = root / "target"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            start.mkdir(parents=True)
+            target.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            (config_dir / "commands.yaml").write_text(
+                "bais:\n"
+                "  description: cd better ai studio\n"
+                "  steps:\n"
+                f'    - command: "cd {target}"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            command = (
+                "set -e; "
+                f"cd {shlex.quote(str(start))}; "
+                'eval "$(commands-wrapper hook)"; '
+                "type bais >/dev/null; "
+                "bais; "
+                "pwd"
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout.strip().splitlines()[-1], str(target))
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_local_commands_are_promoted_for_cross_directory_listing_integration(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            project = root / "project"
+            elsewhere = root / "elsewhere"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            project.mkdir(parents=True)
+            elsewhere.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            global_file = config_dir / "commands.yaml"
+            global_file.write_text(
+                "dev:\n"
+                "  description: npm run dev\n"
+                "  steps:\n"
+                '    - command: "npm run dev"\n',
+                encoding="utf-8",
+            )
+            (project / "commands.yaml").write_text(
+                "bais:\n"
+                "  description: cd better ai studio\n"
+                f'  steps:\n    - command: "cd {project}"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            promote_cmd = (
+                f"cd {shlex.quote(str(project))}; commands-wrapper list >/dev/null"
+            )
+            promote_result = subprocess.run(
+                ["/bin/bash", "-lc", promote_cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(promote_result.returncode, 0, promote_result.stdout)
+
+            list_cmd = f"cd {shlex.quote(str(elsewhere))}; commands-wrapper list"
+            list_result = subprocess.run(
+                ["/bin/bash", "-lc", list_cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(list_result.returncode, 0, list_result.stdout)
+            self.assertIn("bais", list_result.stdout)
+
+            content = global_file.read_text(encoding="utf-8")
+            self.assertIn("dev:", content)
+            self.assertIn("bais:", content)
 
 
 if __name__ == "__main__":
