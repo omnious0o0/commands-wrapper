@@ -9,6 +9,7 @@ import subprocess
 import argparse
 import shlex
 import threading
+import re
 import urllib.error
 import urllib.request
 import yaml
@@ -117,6 +118,40 @@ def _command_file_candidates(root: str) -> List[str]:
 def _env_flag_enabled(name: str) -> bool:
     value = os.environ.get(name, '').strip().casefold()
     return value in {'1', 'true', 'yes', 'on'}
+
+
+COMMAND_OUTPUT_REDACTION_ENV = 'COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT'
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b((?:api[_-]?key|token|secret|password|passwd|pwd|authorization|auth)[\w-]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_SENSITIVE_FLAG_RE = re.compile(
+    r"(?i)(--?(?:api[_-]?key|token|secret|password|passwd|authorization|auth)\b(?:=|\s+))(\"[^\"]*\"|'[^']*'|[^\s]+)"
+)
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|token)\s+)([^\s\"']+)")
+_SECRET_TOKEN_RES = (
+    re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+)
+
+
+def _redact_command_text(command_text: str) -> str:
+    redacted = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1=[REDACTED]", command_text)
+    redacted = _SENSITIVE_FLAG_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", redacted)
+
+    for secret_re in _SECRET_TOKEN_RES:
+        redacted = secret_re.sub('[REDACTED]', redacted)
+
+    return redacted
+
+
+def _display_command_text(command_text: str) -> str:
+    if _env_flag_enabled(COMMAND_OUTPUT_REDACTION_ENV):
+        return _redact_command_text(command_text)
+    return command_text
 
 
 def _preferred_command_file_for_write() -> str:
@@ -2203,10 +2238,11 @@ def _finalize_process(proc: ProcessAdapter) -> None:
         proc.close()
 
     code = proc.returncode()
+    display_command = _display_command_text(proc.command_text())
     if code is None:
-        raise ValueError(f"unable to determine exit status for command: {proc.command_text()}")
+        raise ValueError(f"unable to determine exit status for command: {display_command}")
     if code != 0:
-        raise CommandStepFailedError(proc.command_text(), code)
+        raise CommandStepFailedError(display_command, code)
 
 
 def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
@@ -2227,7 +2263,8 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
             _change_directory(cd_target)
             return None
 
-        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{command_text}")
+        display_command_text = _display_command_text(command_text)
+        print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{display_command_text}")
         return _spawn_process(command_text, timeout)
 
     if 'send' in ctx:
@@ -2371,7 +2408,8 @@ def _run_followup_after_cd(
         exec_cmd(resolved_followup, db[resolved_followup])
         return
 
-    print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{followup_text}")
+    display_followup_text = _display_command_text(followup_text)
+    print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{display_followup_text}")
     proc = _spawn_process(followup_text, timeout=None)
     try:
         _finalize_process(proc)

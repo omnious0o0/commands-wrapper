@@ -861,6 +861,84 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIn("unable to send input to running command", str(exc.exception))
 
+    def test_display_command_text_is_raw_by_default(self):
+        command_text = "echo token=super-secret"
+        with mock.patch.dict(
+            os.environ,
+            {cw.COMMAND_OUTPUT_REDACTION_ENV: "0"},
+            clear=False,
+        ):
+            displayed = cw._display_command_text(command_text)
+
+        self.assertEqual(displayed, command_text)
+
+    def test_display_command_text_redacts_sensitive_values_when_enabled(self):
+        command_text = (
+            "echo --token super-secret api_key=abc123 "
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {cw.COMMAND_OUTPUT_REDACTION_ENV: "1"},
+            clear=False,
+        ):
+            displayed = cw._display_command_text(command_text)
+
+        self.assertIn("--token [REDACTED]", displayed)
+        self.assertIn("api_key=[REDACTED]", displayed)
+        self.assertNotIn("super-secret", displayed)
+        self.assertNotIn("abc123", displayed)
+        self.assertNotIn("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234", displayed)
+
+    def test_run_step_command_prints_redacted_preview_when_enabled(self):
+        command_text = "echo token=super-secret"
+        proc = object()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {cw.COMMAND_OUTPUT_REDACTION_ENV: "1"},
+                clear=False,
+            ),
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(cw, "_spawn_process", return_value=proc) as spawn_mock,
+        ):
+            returned = cw.run_step(None, {"command": command_text}, timeout=None)
+
+        self.assertIs(returned, proc)
+        spawn_mock.assert_called_once_with(command_text, None)
+        printed = print_mock.call_args.args[0]
+        self.assertIn("token=[REDACTED]", printed)
+        self.assertNotIn("super-secret", printed)
+
+    def test_finalize_process_redacts_command_in_error_when_enabled(self):
+        class DummyProc:
+            def interact(self):
+                return None
+
+            def close(self):
+                return None
+
+            def returncode(self):
+                return 7
+
+            def command_text(self):
+                return "echo --token super-secret"
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {cw.COMMAND_OUTPUT_REDACTION_ENV: "1"},
+                clear=False,
+            ),
+            self.assertRaises(cw.CommandStepFailedError) as exc,
+        ):
+            cw._finalize_process(DummyProc())
+
+        message = str(exc.exception)
+        self.assertIn("[REDACTED]", message)
+        self.assertNotIn("super-secret", message)
+
     def test_exec_cmd_reports_finalize_value_errors(self):
         cfg = {
             "steps": [{"command": "echo hi"}],
