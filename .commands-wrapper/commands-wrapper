@@ -68,6 +68,7 @@ ESC_KEY_DELAY_MS = 25
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WRAPPER_MARKER = "COMMANDS-WRAPPER-GENERATED"
+WRAPPER_CWD_CONTEXT_TTL_SECONDS = 30.0
 
 
 def _script_bin_dir(platform_name: Optional[str] = None) -> str:
@@ -1149,6 +1150,173 @@ def _atomic_write_text(file_path: str, content: str) -> None:
                 pass
 
 
+def _wrapper_cwd_context_path() -> str:
+    runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '').strip()
+    if runtime_dir:
+        base_dir = os.path.expanduser(runtime_dir)
+    else:
+        base_dir = tempfile.gettempdir()
+
+    uid_getter = getattr(os, 'getuid', None)
+    if callable(uid_getter):
+        uid_segment = str(uid_getter())
+    else:
+        uid_segment = (
+            os.environ.get('USERNAME', '').strip()
+            or os.environ.get('USER', '').strip()
+            or 'default'
+        )
+
+    return os.path.join(base_dir, f'commands-wrapper-cwd-context-{uid_segment}.yaml')
+
+
+def _load_wrapper_cwd_context(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    context_path = path or _wrapper_cwd_context_path()
+    try:
+        with open(context_path, encoding='utf-8') as fd:
+            loaded = yaml.safe_load(fd)
+    except (OSError, yaml.YAMLError):
+        return {}
+
+    if not isinstance(loaded, dict):
+        return {}
+
+    context: Dict[str, Dict[str, Any]] = {}
+    for raw_pid, raw_entry in loaded.items():
+        pid = str(raw_pid).strip()
+        if not pid or not isinstance(raw_entry, dict):
+            continue
+
+        cwd_value = raw_entry.get('cwd')
+        expires_at_value = raw_entry.get('expires_at')
+        if not isinstance(cwd_value, str) or not cwd_value:
+            continue
+        if not isinstance(expires_at_value, (int, float, str)):
+            continue
+
+        try:
+            expires_at = float(expires_at_value)
+        except (TypeError, ValueError):
+            continue
+
+        context[pid] = {
+            'cwd': cwd_value,
+            'expires_at': expires_at,
+        }
+
+    return context
+
+
+def _save_wrapper_cwd_context(context: Dict[str, Dict[str, Any]], path: Optional[str] = None) -> None:
+    context_path = path or _wrapper_cwd_context_path()
+
+    if not context:
+        try:
+            os.remove(context_path)
+        except OSError:
+            pass
+        return
+
+    parent = os.path.dirname(context_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return
+
+    try:
+        content = yaml.safe_dump(context, sort_keys=True)
+    except yaml.YAMLError:
+        return
+
+    try:
+        _atomic_write_text(context_path, content)
+    except OSError:
+        pass
+
+
+def _prune_wrapper_cwd_context(context: Dict[str, Dict[str, Any]], now: Optional[float] = None) -> None:
+    current_time = time.time() if now is None else now
+    for pid in list(context.keys()):
+        entry = context.get(pid)
+        if not isinstance(entry, dict):
+            context.pop(pid, None)
+            continue
+
+        cwd_value = entry.get('cwd')
+        expires_at_value = entry.get('expires_at')
+        if not isinstance(cwd_value, str) or not cwd_value:
+            context.pop(pid, None)
+            continue
+        if not isinstance(expires_at_value, (int, float, str)):
+            context.pop(pid, None)
+            continue
+
+        try:
+            expires_at = float(expires_at_value)
+        except (TypeError, ValueError):
+            context.pop(pid, None)
+            continue
+
+        if expires_at <= current_time:
+            context.pop(pid, None)
+
+
+def _remember_wrapper_cwd_context(parent_pid: int, cwd: str) -> None:
+    if parent_pid <= 0 or not cwd:
+        return
+
+    context = _load_wrapper_cwd_context()
+    _prune_wrapper_cwd_context(context)
+    context[str(parent_pid)] = {
+        'cwd': cwd,
+        'expires_at': time.time() + WRAPPER_CWD_CONTEXT_TTL_SECONDS,
+    }
+    _save_wrapper_cwd_context(context)
+
+
+def _consume_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
+    if parent_pid <= 0:
+        return None
+
+    context = _load_wrapper_cwd_context()
+    _prune_wrapper_cwd_context(context)
+    entry = context.pop(str(parent_pid), None)
+    _save_wrapper_cwd_context(context)
+
+    if not isinstance(entry, dict):
+        return None
+
+    cwd_value = entry.get('cwd')
+    if not isinstance(cwd_value, str) or not cwd_value:
+        return None
+
+    return cwd_value
+
+
+def _apply_wrapper_cwd_context(parent_pid: Optional[int]) -> None:
+    if not parent_pid:
+        return
+
+    pending_cwd = _consume_wrapper_cwd_context(parent_pid)
+    if not pending_cwd:
+        return
+
+    try:
+        previous = os.getcwd()
+    except OSError:
+        previous = ''
+
+    try:
+        os.chdir(pending_cwd)
+    except OSError:
+        return
+
+    if previous:
+        os.environ['OLDPWD'] = previous
+    os.environ['PWD'] = os.getcwd()
+
+
 
 def sync_binaries(
     db: Dict[str, Any],
@@ -1241,7 +1409,12 @@ def sync_binaries(
             ps1_forward = '@args'
         else:
             command_name_q = shlex.quote(command_name)
-            unix_exec_line = f'exec {wrapper_target_q} {command_name_q} "$@"\n'
+            entry_q = shlex.quote(entry)
+            unix_exec_line = (
+                f'COMMANDS_WRAPPER_WRAPPER_ENTRY=1 '
+                f'COMMANDS_WRAPPER_WRAPPER_NAME={entry_q} '
+                f'exec {wrapper_target_q} {command_name_q} "$@"\n'
+            )
             cmd_forward = f'{_cmd_quote(command_name)} %*'
             ps1_forward = f'{_cmd_quote(command_name)} @args'
 
@@ -2060,7 +2233,10 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
     if 'send' in ctx:
         if not proc:
             raise ValueError("'send' step requires a running command step")
-        proc.sendline(str(ctx['send']))
+        try:
+            proc.sendline(str(ctx['send']))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unable to send input to running command: {exc}") from exc
         return proc
 
     if 'press_key' in ctx:
@@ -2068,14 +2244,17 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
             raise ValueError("'press_key' step requires a running command step")
         raw_key = str(ctx['press_key'])
         key_name = raw_key.strip().casefold()
-        if key_name in ('enter', 'return'):
-            proc.sendline()
-        elif key_name == 'tab':
-            proc.send('\t')
-        elif key_name in ('esc', 'escape'):
-            proc.send('\x1b')
-        else:
-            proc.send(raw_key)
+        try:
+            if key_name in ('enter', 'return'):
+                proc.sendline()
+            elif key_name == 'tab':
+                proc.send('\t')
+            elif key_name in ('esc', 'escape'):
+                proc.send('\x1b')
+            else:
+                proc.send(raw_key)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unable to send input to running command: {exc}") from exc
         return proc
 
     if 'wait' in ctx:
@@ -2090,7 +2269,12 @@ def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optio
 
     raise ValueError(f"invalid step object: {ctx}")
 
-def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
+def exec_cmd(
+    name: str,
+    cfg: Dict[str, Any],
+    *,
+    allow_single_cd_shell: bool = True,
+) -> None:
     key = _get_steps_key(cfg)
     if not key:
         _error(f"'{name}' has no steps configured.")
@@ -2138,12 +2322,117 @@ def exec_cmd(name: str, cfg: Dict[str, Any]) -> None:
         except StepTimeoutError:
             _error(f"command '{name}' timed out.")
             sys.exit(1)
-    elif single_cd_step and sys.stdin.isatty() and sys.stdout.isatty():
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+    elif (
+        single_cd_step
+        and allow_single_cd_shell
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    ):
         try:
             _open_interactive_shell()
         except ValueError as exc:
             _error(str(exc))
             sys.exit(1)
+
+
+def _command_uses_single_cd(cfg: Dict[str, Any]) -> bool:
+    steps_key = _get_steps_key(cfg)
+    if not steps_key:
+        return False
+
+    steps = cfg.get(steps_key)
+    return isinstance(steps, list) and _is_single_cd_step(steps)
+
+
+def _normalize_followup_parts(parts: List[str]) -> List[str]:
+    if parts and parts[0] == '--':
+        return parts[1:]
+    return parts
+
+
+def _run_followup_after_cd(
+    base_command_name: str,
+    followup_parts: List[str],
+    db: Dict[str, Dict[str, Any]],
+    lookup_index: Dict[str, str],
+) -> None:
+    normalized_followup_parts = _normalize_followup_parts(followup_parts)
+    followup_text = " ".join(normalized_followup_parts).strip()
+    if not followup_text:
+        raise ValueError(
+            f"'{base_command_name}' requires a follow-up command when extra tokens are provided"
+        )
+
+    resolved_followup = _resolve_command_name(followup_text, db, lookup_index)
+    if resolved_followup:
+        exec_cmd(resolved_followup, db[resolved_followup])
+        return
+
+    print(f"\n{ANSI_MUTED}$ {ANSI_RESET}{followup_text}")
+    proc = _spawn_process(followup_text, timeout=None)
+    try:
+        _finalize_process(proc)
+    except CommandStepFailedError as exc:
+        _error(str(exc))
+        sys.exit(_safe_exit_code(exc.exit_code))
+    except StepTimeoutError:
+        _error(f"follow-up command after '{base_command_name}' timed out.")
+        sys.exit(1)
+    except ValueError as exc:
+        _error(str(exc))
+        sys.exit(1)
+
+
+def _single_cd_destination_for_command(
+    name: str,
+    db: Dict[str, Dict[str, Any]],
+    lookup_index: Dict[str, str],
+) -> Optional[str]:
+    resolved_name = _resolve_command_name(name, db, lookup_index)
+    if not resolved_name:
+        return None
+
+    cfg = db.get(resolved_name)
+    if not isinstance(cfg, dict):
+        return None
+
+    steps_key = _get_steps_key(cfg)
+    if not steps_key:
+        return None
+
+    steps = cfg.get(steps_key)
+    if not isinstance(steps, list) or not _is_single_cd_step(steps):
+        return None
+
+    step = steps[0]
+    if not isinstance(step, dict):
+        return None
+
+    cd_target = _extract_cd_target(step.get('command'))
+    if cd_target is None:
+        return None
+
+    return _resolve_cd_target(cd_target)
+
+
+def _expect_no_extra_action_parts(action_parts: List[str], usage: str) -> None:
+    if len(action_parts) > 1:
+        _error(usage)
+        sys.exit(1)
+
+
+def _is_posix_function_name(name: str) -> bool:
+    if not name:
+        return False
+
+    first = name[0]
+    if not (first.isalpha() or first == '_'):
+        return False
+
+    return all(c.isalnum() or c == '_' for c in name[1:])
 
 
 def print_list(db: Dict):
@@ -2204,7 +2493,7 @@ def cmd_add_yaml(yaml_str: str):
 
         lookup_key = _command_lookup_key(normalized_name)
         existing_name = lookup_index.get(lookup_key)
-        if existing_name and existing_name != normalized_name:
+        if existing_name:
             _error(
                 f"skipping '{name}': conflicts with existing command '{existing_name}' under case-insensitive lookup"
             )
@@ -2417,6 +2706,12 @@ def main():
     action = action_parts[0]
     normalized_action = action.casefold()
     full_action = " ".join(action_parts)
+    wrapper_entry = os.environ.get('COMMANDS_WRAPPER_WRAPPER_ENTRY', '').strip() == '1'
+    wrapper_parent_pid = os.getppid() if wrapper_entry else None
+    internal_cd_target_action = (
+        normalized_action == '__cd-target'
+        and os.environ.get('COMMANDS_WRAPPER_INTERNAL', '').strip() == '1'
+    )
 
     load_warnings: List[str] = []
     db = load_cmds(find_yamls(), warnings=load_warnings)
@@ -2431,7 +2726,45 @@ def main():
     resolved_full_action = _resolve_command_name(full_action, db, lookup_index)
     resolved_action = _resolve_command_name(action, db, lookup_index)
 
-    if normalized_action not in ('sync', 'add', 'rm', 'remove', 'configure', 'config'):
+    def _exec_target_with_wrapper_context(
+        target_name: str,
+        *,
+        allow_single_cd_shell: bool = True,
+    ) -> None:
+        cfg = db[target_name]
+        wrapper_single_cd = (
+            wrapper_entry
+            and len(action_parts) == 1
+            and _command_uses_single_cd(cfg)
+        )
+
+        if wrapper_entry and not wrapper_single_cd:
+            _apply_wrapper_cwd_context(wrapper_parent_pid)
+
+        effective_allow_single_cd_shell = allow_single_cd_shell and not wrapper_single_cd
+        if effective_allow_single_cd_shell:
+            exec_cmd(target_name, cfg)
+        else:
+            exec_cmd(
+                target_name,
+                cfg,
+                allow_single_cd_shell=False,
+            )
+
+        if wrapper_single_cd and wrapper_parent_pid is not None:
+            _remember_wrapper_cwd_context(wrapper_parent_pid, os.getcwd())
+
+    if (
+        normalized_action not in (
+            'sync',
+            'add',
+            'rm',
+            'remove',
+            'configure',
+            'config',
+        )
+        and not internal_cd_target_action
+    ):
         sync_kwargs: Dict[str, Any] = {
             'report_conflicts': False,
             'prune_stale': False,
@@ -2439,6 +2772,22 @@ def main():
         if load_warnings:
             _warn("Skipping stale wrapper cleanup because command files have warnings.")
         _report_sync_messages(sync_binaries(db, **sync_kwargs))
+
+    if internal_cd_target_action:
+        command_name = " ".join(action_parts[1:]).strip()
+        if not command_name:
+            _error(f"Usage: {PRIMARY_WRAPPER} __cd-target <command-name>")
+            sys.exit(1)
+
+        try:
+            destination = _single_cd_destination_for_command(command_name, db, lookup_index)
+        except ValueError as exc:
+            _error(str(exc))
+            sys.exit(1)
+
+        if destination:
+            print(destination)
+        return
 
     if normalized_action == 'sync':
         sync_args = action_parts[1:]
@@ -2461,19 +2810,23 @@ def main():
         return
 
     if resolved_full_action:
-        exec_cmd(resolved_full_action, db[resolved_full_action])
+        _exec_target_with_wrapper_context(resolved_full_action)
         return
 
     if normalized_action in ('-h', '--help'):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} --help")
         p.print_help()
 
     elif normalized_action in ('update', 'upd'):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} update")
         _auto_update()
 
     elif normalized_action in ('ls', 'list'):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} list")
         print_list(db)
 
     elif normalized_action == 'hook':
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} hook")
         target_dir = _script_bin_dir(os.name)
         wrappers, wrapper_errors, _ = _build_wrapper_map_with_conflicts(db, target_dir)
         _report_sync_messages(wrapper_errors)
@@ -2483,18 +2836,46 @@ def main():
             for wrapper_name, command_name in sorted(wrappers.items()):
                 print(f'doskey {wrapper_name}={PRIMARY_WRAPPER} {_cmd_quote(command_name)} $*')
         else:
-            print(f"alias {SHORT_ALIAS}='{PRIMARY_WRAPPER}'")
+            print(f"{SHORT_ALIAS}() {{ command {PRIMARY_WRAPPER} \"$@\"; }}")
             print(f"alias {LEGACY_ALIAS}='{PRIMARY_WRAPPER}'")
+            print("__commands_wrapper_dispatch() {")
+            print("  if [ \"$#\" -lt 1 ]; then")
+            print("    return 2")
+            print("  fi")
+            print("  __cw_name=\"$1\"")
+            print("  shift")
+            print(
+                f"  __cw_target=\"$(COMMANDS_WRAPPER_INTERNAL=1 command {PRIMARY_WRAPPER} __cd-target \"$__cw_name\" 2>/dev/null)\" || return $?"
+            )
+            print("  if [ -n \"$__cw_target\" ]; then")
+            print("    builtin cd -- \"$__cw_target\" || return $?")
+            print("    if [ \"$#\" -gt 0 ] && [ \"$1\" = \"--\" ]; then")
+            print("      shift")
+            print("    fi")
+            print("    if [ \"$#\" -gt 0 ]; then")
+            print("      \"$@\"")
+            print("      return $?")
+            print("    fi")
+            print("    return 0")
+            print("  fi")
+            print(f"  command {PRIMARY_WRAPPER} \"$__cw_name\" \"$@\"")
+            print("}")
             for wrapper_name, command_name in sorted(wrappers.items()):
                 quoted_command = shlex.quote(command_name)
-                print(f"alias {wrapper_name}=\"{PRIMARY_WRAPPER} {quoted_command}\"")
+                if _is_posix_function_name(wrapper_name):
+                    print(
+                        f"{wrapper_name}() {{ __commands_wrapper_dispatch {quoted_command} \"$@\"; }}"
+                    )
+                else:
+                    print(f"alias {wrapper_name}=\"{PRIMARY_WRAPPER} {quoted_command}\"")
 
     elif normalized_action in ('configure', 'config'):
+        _expect_no_extra_action_parts(action_parts, f"Usage: {PRIMARY_WRAPPER} configure")
         run_wizard()
 
     elif normalized_action == 'add':
         _filtered_argv, has_yaml_flag = _strip_add_yaml_flag([PRIMARY_WRAPPER, *action_parts])
-        if not has_yaml_flag:
+        if not has_yaml_flag or len(_filtered_argv) != 2:
             _error(f"Usage: {PRIMARY_WRAPPER} add --yaml <<EOF\\n...\\nEOF")
             sys.exit(1)
         yaml_content = sys.stdin.read()
@@ -2527,9 +2908,36 @@ def main():
             sys.exit(1)
 
     else:
+        if resolved_action and len(action_parts) > 1:
+            if _command_uses_single_cd(db[resolved_action]):
+                if wrapper_entry and wrapper_parent_pid is not None:
+                    _consume_wrapper_cwd_context(wrapper_parent_pid)
+                exec_cmd(
+                    resolved_action,
+                    db[resolved_action],
+                    allow_single_cd_shell=False,
+                )
+                try:
+                    _run_followup_after_cd(
+                        resolved_action,
+                        action_parts[1:],
+                        db,
+                        lookup_index,
+                    )
+                except ValueError as exc:
+                    _error(str(exc))
+                    sys.exit(1)
+                return
+
+            _error(
+                f"'{full_action}' not found. '{resolved_action}' is a complete command name; "
+                "extra tokens are not ignored."
+            )
+            sys.exit(1)
+
         target = resolved_full_action or resolved_action
         if target:
-            exec_cmd(target, db[target])
+            _exec_target_with_wrapper_context(target)
         else:
             _error(f"'{full_action}' not found")
             sys.exit(1)

@@ -458,6 +458,31 @@ class CommandsWrapperTests(unittest.TestCase):
             namespace_content = namespace_wrapper.read_text(encoding="utf-8")
             self.assertIn(' claw "$@"', namespace_content)
 
+    def test_sync_binaries_marks_command_wrappers_with_wrapper_env(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target_bin = Path(tmp) / "target-bin"
+            target_bin.mkdir(parents=True)
+
+            with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+                messages = cw.sync_binaries(
+                    db,
+                    bin_dir=str(target_bin),
+                    platform_name="posix",
+                    report_conflicts=False,
+                )
+
+            self.assertFalse(any(not msg.startswith("WARN:") for msg in messages))
+            wrapper_content = (target_bin / "oc").read_text(encoding="utf-8")
+            self.assertIn("COMMANDS_WRAPPER_WRAPPER_ENTRY=1", wrapper_content)
+            self.assertIn("COMMANDS_WRAPPER_WRAPPER_NAME=oc", wrapper_content)
+
     def test_sync_binaries_skips_primary_wrapper_name(self):
         db = {
             "commands-wrapper": {
@@ -592,6 +617,118 @@ class CommandsWrapperTests(unittest.TestCase):
 
         exec_mock.assert_called_once_with("claw upd", db["claw upd"])
 
+    def test_main_rejects_unresolved_multi_word_for_non_cd_command(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "oc", "dev"]),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        exec_mock.assert_not_called()
+        self.assertIn("'oc dev' not found", error_mock.call_args[0][0])
+
+    def test_main_runs_followup_after_single_cd_command(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(cw, "_run_followup_after_cd") as followup_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "oc", "dev"]),
+        ):
+            cw.main()
+
+        exec_mock.assert_called_once_with(
+            "oc",
+            db["oc"],
+            allow_single_cd_shell=False,
+        )
+        followup_mock.assert_called_once()
+        self.assertEqual(followup_mock.call_args.args[0], "oc")
+        self.assertEqual(followup_mock.call_args.args[1], ["dev"])
+
+    def test_main_wrapper_entry_single_cd_stores_pending_context(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_apply_wrapper_cwd_context") as apply_mock,
+            mock.patch.object(cw, "_remember_wrapper_cwd_context") as remember_mock,
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(cw.os, "getcwd", return_value="/tmp"),
+            mock.patch.object(sys, "argv", ["commands-wrapper", "oc"]),
+            mock.patch.dict(
+                os.environ,
+                {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
+                clear=False,
+            ),
+        ):
+            cw.main()
+
+        apply_mock.assert_not_called()
+        exec_mock.assert_called_once_with(
+            "oc",
+            db["oc"],
+            allow_single_cd_shell=False,
+        )
+        remember_mock.assert_called_once()
+        self.assertEqual(remember_mock.call_args.args[1], "/tmp")
+
+    def test_main_wrapper_entry_non_cd_applies_pending_context(self):
+        db = {
+            "dev": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_apply_wrapper_cwd_context") as apply_mock,
+            mock.patch.object(cw, "_remember_wrapper_cwd_context") as remember_mock,
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "dev"]),
+            mock.patch.dict(
+                os.environ,
+                {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
+                clear=False,
+            ),
+        ):
+            cw.main()
+
+        apply_mock.assert_called_once()
+        remember_mock.assert_not_called()
+        exec_mock.assert_called_once_with("dev", db["dev"])
+
     def test_main_prefers_exact_command_before_add_yaml_flag_handling(self):
         db = {
             "add --yaml demo": {
@@ -713,6 +850,86 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIs(returned, proc)
         self.assertEqual(proc.calls, [("sendline", "")])
+
+    def test_run_step_send_wraps_process_io_errors(self):
+        class DummyProc:
+            def sendline(self, _text=""):
+                raise BrokenPipeError("broken pipe")
+
+        with self.assertRaises(ValueError) as exc:
+            cw.run_step(DummyProc(), {"send": "hello"}, timeout=None)
+
+        self.assertIn("unable to send input to running command", str(exc.exception))
+
+    def test_exec_cmd_reports_finalize_value_errors(self):
+        cfg = {
+            "steps": [{"command": "echo hi"}],
+        }
+        proc = object()
+
+        with (
+            mock.patch.object(cw, "run_step", return_value=proc),
+            mock.patch.object(
+                cw,
+                "_finalize_process",
+                side_effect=ValueError(
+                    "unable to determine exit status for command: echo hi"
+                ),
+            ),
+            mock.patch.object(cw, "_error") as error_mock,
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.exec_cmd("demo", cfg)
+
+        self.assertEqual(exc.exception.code, 1)
+        error_mock.assert_called_once_with(
+            "unable to determine exit status for command: echo hi"
+        )
+
+    def test_run_followup_after_cd_executes_named_wrapper_command(self):
+        db = {
+            "dev": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+        lookup_index, errors = cw._build_command_lookup_index(db)
+
+        self.assertFalse(errors)
+        with mock.patch.object(cw, "exec_cmd") as exec_mock:
+            cw._run_followup_after_cd("oc", ["dev"], db, lookup_index)
+
+        exec_mock.assert_called_once_with("dev", db["dev"])
+
+    def test_run_followup_after_cd_ignores_leading_double_dash(self):
+        db = {
+            "dev": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+        lookup_index, errors = cw._build_command_lookup_index(db)
+
+        self.assertFalse(errors)
+        with mock.patch.object(cw, "exec_cmd") as exec_mock:
+            cw._run_followup_after_cd("oc", ["--", "dev"], db, lookup_index)
+
+        exec_mock.assert_called_once_with("dev", db["dev"])
+
+    def test_wrapper_cwd_context_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "cwd-context.yaml"
+            with mock.patch.object(
+                cw,
+                "_wrapper_cwd_context_path",
+                return_value=str(context_path),
+            ):
+                cw._remember_wrapper_cwd_context(12345, "/tmp")
+                consumed = cw._consume_wrapper_cwd_context(12345)
+                consumed_again = cw._consume_wrapper_cwd_context(12345)
+
+        self.assertEqual(consumed, "/tmp")
+        self.assertIsNone(consumed_again)
 
     def test_pexpect_log_sink_accepts_text_and_bytes(self):
         stream = io.StringIO()
@@ -1287,6 +1504,50 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertIn("Foo:", content)
             self.assertNotIn("foo:\n", content)
 
+    def test_cmd_add_yaml_exits_nonzero_on_exact_name_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            home = root / "home"
+            xdg = root / "xdg"
+            work.mkdir(parents=True)
+            home.mkdir(parents=True)
+            xdg.mkdir(parents=True)
+
+            commands_file = work / "commands.yaml"
+            commands_file.write_text(
+                'foo:\n  description: first\n  steps:\n    - command: "echo one"\n',
+                encoding="utf-8",
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(xdg),
+            }
+
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(work)
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    self.assertRaises(SystemExit) as exc,
+                    mock.patch.object(cw, "_error") as error_mock,
+                ):
+                    cw.cmd_add_yaml(
+                        "foo:\n"
+                        "  description: second\n"
+                        "  steps:\n"
+                        '    - command: "echo two"\n'
+                    )
+            finally:
+                os.chdir(prev_cwd)
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertGreaterEqual(error_mock.call_count, 1)
+            content = commands_file.read_text(encoding="utf-8")
+            self.assertIn("description: first", content)
+            self.assertNotIn("description: second", content)
+
     def test_cmd_add_yaml_persists_commands_when_sync_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1571,6 +1832,115 @@ class CommandsWrapperTests(unittest.TestCase):
             )
         )
         list_mock.assert_called_once_with({})
+
+    def test_main_list_rejects_unexpected_trailing_tokens(self):
+        with (
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "print_list") as list_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "list", "extra"]),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        list_mock.assert_not_called()
+        error_mock.assert_called_once_with(f"Usage: {cw.PRIMARY_WRAPPER} list")
+
+    def test_main_add_yaml_rejects_extra_positional_tokens(self):
+        with (
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "cmd_add_yaml") as add_yaml_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(
+                sys,
+                "argv",
+                ["commands-wrapper", "add", "--yaml", "extra"],
+            ),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        add_yaml_mock.assert_not_called()
+        self.assertIn(
+            f"Usage: {cw.PRIMARY_WRAPPER} add --yaml",
+            error_mock.call_args[0][0],
+        )
+
+    def test_main_internal_cd_target_prints_destination(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries") as sync_mock,
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "__cd-target", "oc"]),
+            mock.patch.dict(
+                os.environ, {"COMMANDS_WRAPPER_INTERNAL": "1"}, clear=False
+            ),
+        ):
+            cw.main()
+
+        sync_mock.assert_not_called()
+        print_mock.assert_called_once_with("/tmp")
+
+    def test_main_internal_cd_target_is_silent_for_non_cd_command(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "echo hi"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries") as sync_mock,
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "__cd-target", "oc"]),
+            mock.patch.dict(
+                os.environ, {"COMMANDS_WRAPPER_INTERNAL": "1"}, clear=False
+            ),
+        ):
+            cw.main()
+
+        sync_mock.assert_not_called()
+        print_mock.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX hook output only")
+    def test_main_hook_outputs_dispatch_function_and_identifier_wrappers(self):
+        wrappers = {
+            "oc": "oc",
+            "claw-doc": "claw doc",
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(
+                cw,
+                "_build_wrapper_map_with_conflicts",
+                return_value=(wrappers, [], {}),
+            ),
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "hook"]),
+        ):
+            cw.main()
+
+        printed_lines = [call.args[0] for call in print_mock.call_args_list]
+        self.assertIn("__commands_wrapper_dispatch() {", printed_lines)
+        self.assertIn('oc() { __commands_wrapper_dispatch oc "$@"; }', printed_lines)
+        self.assertIn("alias claw-doc=\"commands-wrapper 'claw doc'\"", printed_lines)
 
     def test_main_command_execution_suppresses_wrapper_conflict_warnings(self):
         db = {
