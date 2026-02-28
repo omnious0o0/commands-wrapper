@@ -686,7 +686,10 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(sys, "argv", ["commands-wrapper", "oc"]),
             mock.patch.dict(
                 os.environ,
-                {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
+                {
+                    "COMMANDS_WRAPPER_WRAPPER_ENTRY": "1",
+                    cw.HOOK_ACTIVE_ENV: "1",
+                },
                 clear=False,
             ),
         ):
@@ -700,6 +703,37 @@ class CommandsWrapperTests(unittest.TestCase):
         )
         remember_mock.assert_called_once()
         self.assertEqual(remember_mock.call_args.args[1], "/tmp")
+
+    def test_main_wrapper_entry_single_cd_without_hook_reports_error(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            }
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries", return_value=[]),
+            mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "exec_cmd") as exec_mock,
+            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper", "oc"]),
+            mock.patch.dict(
+                os.environ,
+                {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
+                clear=False,
+            ),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        exec_mock.assert_not_called()
+        self.assertIn(
+            "single-directory wrappers require shell hook initialization",
+            error_mock.call_args.args[0],
+        )
 
     def test_main_wrapper_entry_non_cd_applies_pending_context(self):
         db = {
@@ -2114,6 +2148,7 @@ class CommandsWrapperTests(unittest.TestCase):
 
         printed_lines = [call.args[0] for call in print_mock.call_args_list]
         self.assertIn("__commands_wrapper_dispatch() {", printed_lines)
+        self.assertIn(f"export {cw.HOOK_ACTIVE_ENV}=1", printed_lines)
         self.assertIn('oc() { __commands_wrapper_dispatch oc "$@"; }', printed_lines)
         self.assertIn("alias claw-doc=\"commands-wrapper 'claw doc'\"", printed_lines)
 

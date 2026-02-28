@@ -60,6 +60,7 @@ HEADER_TITLE = "commands-wrapper"
 PRIMARY_WRAPPER = "commands-wrapper"
 SHORT_ALIAS = "cw"
 LEGACY_ALIAS = "command-wrapper"
+HOOK_ACTIVE_ENV = 'COMMANDS_WRAPPER_HOOK_ACTIVE'
 
 DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
@@ -2933,6 +2934,13 @@ def main():
             and _command_uses_single_cd(cfg)
         )
 
+        if wrapper_single_cd and not _env_flag_enabled(HOOK_ACTIVE_ENV):
+            _error(
+                "single-directory wrappers require shell hook initialization. "
+                f"Run: eval \"$({PRIMARY_WRAPPER} hook)\" and add it to your shell config."
+            )
+            sys.exit(1)
+
         if wrapper_entry and not wrapper_single_cd:
             _apply_wrapper_cwd_context(wrapper_parent_pid)
 
@@ -3033,6 +3041,7 @@ def main():
         else:
             print(f"{SHORT_ALIAS}() {{ command {PRIMARY_WRAPPER} \"$@\"; }}")
             print(f"alias {LEGACY_ALIAS}='{PRIMARY_WRAPPER}'")
+            print(f"export {HOOK_ACTIVE_ENV}=1")
             print("__commands_wrapper_dispatch() {")
             print("  if [ \"$#\" -lt 1 ]; then")
             print("    return 2")
