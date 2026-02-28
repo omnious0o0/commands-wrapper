@@ -95,8 +95,8 @@ command-name:
 - `- command: "cd /some/path"` updates the working directory for following steps.
 - Running `commands-wrapper <name>` directly still opens an interactive shell for
   single-`cd` wrappers.
-- Running generated wrapper executables for single-`cd` commands requires hook
-  initialization in your shell.
+- Running generated wrapper executables for single-`cd` commands auto-bootstrap
+  shell hook initialization when needed.
 - With `eval "$(commands-wrapper hook)"` enabled, single-`cd` wrappers change the
   current shell directory directly and chains like `oc && dev` work in one shell.
 
@@ -184,10 +184,10 @@ Optional environment variables for update:
 commands-wrapper hook
 ```
 
-On POSIX shells, hook output now uses shell functions for wrapper names that are
+On POSIX shells, hook output uses shell functions for wrapper names that are
 valid function identifiers. This allows single-`cd` wrappers to change the current
 shell directory directly (instead of opening a nested shell), so chaining like
-`oc && dev` works as expected after the hook is loaded.
+`oc && dev` works as expected after hook initialization.
 
 Typical shell init usage:
 

@@ -178,8 +178,8 @@ then
 fi
 
 echo
-echo -e "${GRAY}Enable shell hook (required for single-cd wrappers):${RESET}"
-echo -e "eval \"\$(commands-wrapper hook)\""
+echo -e "${GRAY}Shell hook is bootstrapped automatically for single-cd wrappers.${RESET}"
+echo -e "${GRAY}Optional manual setup:${RESET} eval \"\$(commands-wrapper hook)\""
 echo
 echo -e "${GREEN}commands-wrapper installed.${RESET}"
 echo -e "${GRAY}Run 'commands-wrapper --help' to get started.${RESET}"
