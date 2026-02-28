@@ -1,16 +1,20 @@
 # commands-wrapper
 
-`commands-wrapper` wraps multi-step shell sequences into a single named command.
+## What it does
 
-## OS support
+commands-wrapper wraps multi-step shell sequences into a single named command.
 
-- ✅ Linux
-- ✅ macOS
-- ✅ Windows (PowerShell + CMD wrappers)
+It can be used to simply rename commands, or craft a command that performs multiple commands and steps using a single named command.
 
-Generated wrappers:
-- Linux/macOS: `cw`, `command-wrapper`, and command-name shims in your Python user `bin` directory (commonly `~/.local/bin`)
-- Windows: `.cmd` and `.ps1` shims in your Python user `Scripts` directory
+## Usage examples
+
+How I personally like to use it:
+
+1. renaming a command
+instead of `cd <directory path>`, I make a simple command like `OAA` to navigate to that directory without me having to manually type the entire path or even memorize it.
+
+2. crafting a command
+
 
 ## Installation
 
@@ -36,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 Remove-Item .\install.ps1
 ```
 
-Optional environment variable for the PowerShell installer:
+Optional environment variables for the PowerShell installer:
 - `COMMANDS_WRAPPER_SOURCE_URL` to override the source URL passed to `pip install`.
 - `COMMANDS_WRAPPER_SOURCE_SHA256` to enforce SHA-256 verification when a remote archive is downloaded first.
 
@@ -70,14 +74,15 @@ Command definitions are discovered from:
 
 When command names overlap, local project definitions take precedence over user/global definitions.
 
-When adding commands and no local config exists, commands-wrapper writes to your user config path by default.
+New commands are written to your user config path by default so they persist across directories and restarts.
+Set `COMMANDS_WRAPPER_PREFER_LOCAL_WRITE=1` if you want new commands to target the current directory config file first.
 
 ### YAML format
 
 ```yaml
 command-name:
   description: "Description of the command"
-  steps <NUM>:
+  steps 60:
     - command: "command to run"
     - send: "text to send to the command"
     - press_key: "key to press"
@@ -86,8 +91,12 @@ command-name:
 
 `cd` commands are handled specially:
 - `- command: "cd /some/path"` updates the working directory for following steps.
-- If a wrapper contains only a single `cd` step and runs in an interactive terminal,
-  commands-wrapper opens a shell in that directory.
+- Running `commands-wrapper <name>` directly still opens an interactive shell for
+  single-`cd` wrappers.
+- Running generated wrapper executables stores the `cd` target for the next wrapper
+  command in the same shell process, so chains like `oc && dev` work without token loss.
+- With `eval "$(commands-wrapper hook)"` enabled, single-`cd` wrappers change the
+  current shell directory directly.
 
 Example:
 
@@ -141,6 +150,9 @@ commands-wrapper remove "command name"
 Wrapper generation and cleanup are automatic whenever commands-wrapper runs or when
 you add/edit/remove commands.
 
+Automatic sync keeps wrappers up to date but does not prune stale wrappers. Use `commands-wrapper sync`
+when you want an explicit stale-wrapper cleanup pass.
+
 If a generated naked wrapper name conflicts with an existing command on your `PATH`,
 commands-wrapper skips that wrapper and prints a warning. Use:
 
@@ -168,6 +180,19 @@ Optional environment variables for update:
 ```bash
 commands-wrapper hook
 ```
+
+On POSIX shells, hook output now uses shell functions for wrapper names that are
+valid function identifiers. This allows single-`cd` wrappers to change the current
+shell directory directly (instead of opening a nested shell), so chaining like
+`oc && dev` works as expected after the hook is loaded.
+
+Typical shell init usage:
+
+```bash
+eval "$(commands-wrapper hook)"
+```
+
+Wrapper names that are not valid shell function identifiers remain aliases.
 
 ### Uninstall
 
