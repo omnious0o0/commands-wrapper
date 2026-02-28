@@ -705,7 +705,7 @@ class CommandsWrapperTests(unittest.TestCase):
         remember_mock.assert_called_once()
         self.assertEqual(remember_mock.call_args.args[1], "/tmp")
 
-    def test_main_wrapper_entry_single_cd_without_hook_reports_error(self):
+    def test_main_wrapper_entry_single_cd_without_hook_bootstraps_hook_and_runs(self):
         db = {
             "oc": {
                 "description": "demo",
@@ -717,24 +717,22 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(cw, "load_cmds", return_value=db),
             mock.patch.object(cw, "sync_binaries", return_value=[]),
             mock.patch.object(cw, "_report_sync_messages", return_value=False),
+            mock.patch.object(cw, "_ensure_shell_hook_init") as ensure_hook_mock,
             mock.patch.object(cw, "exec_cmd") as exec_mock,
-            mock.patch.object(cw, "_error") as error_mock,
+            mock.patch.object(cw, "_remember_wrapper_cwd_context") as remember_mock,
+            mock.patch.object(cw.os, "getcwd", return_value="/tmp"),
             mock.patch.object(sys, "argv", ["commands-wrapper", "oc"]),
             mock.patch.dict(
                 os.environ,
                 {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
                 clear=False,
             ),
-            self.assertRaises(SystemExit) as exc,
         ):
             cw.main()
 
-        self.assertEqual(exc.exception.code, 1)
-        exec_mock.assert_not_called()
-        self.assertIn(
-            "single-directory wrappers require shell hook initialization",
-            error_mock.call_args.args[0],
-        )
+        ensure_hook_mock.assert_called_once_with()
+        exec_mock.assert_called_once_with("oc", db["oc"])
+        remember_mock.assert_called_once()
 
     def test_main_wrapper_entry_non_cd_applies_pending_context(self):
         db = {
@@ -1478,6 +1476,48 @@ class CommandsWrapperTests(unittest.TestCase):
             content = global_file.read_text(encoding="utf-8")
             self.assertIn("dev:", content)
             self.assertNotIn("bais:", content)
+
+    def test_ensure_shell_hook_init_writes_bashrc_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir(parents=True)
+
+            env = {
+                "HOME": str(home),
+                "SHELL": "/bin/bash",
+            }
+
+            with mock.patch.dict(os.environ, env, clear=False):
+                changed = cw._ensure_shell_hook_init()
+
+            self.assertTrue(changed)
+            bashrc = home / ".bashrc"
+            self.assertTrue(bashrc.is_file())
+            content = bashrc.read_text(encoding="utf-8")
+            self.assertIn(cw.HOOK_BLOCK_START, content)
+            self.assertIn(cw.HOOK_BLOCK_END, content)
+            self.assertIn('eval "$(commands-wrapper hook)"', content)
+
+    def test_ensure_shell_hook_init_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir(parents=True)
+
+            env = {
+                "HOME": str(home),
+                "SHELL": "/bin/bash",
+            }
+
+            with mock.patch.dict(os.environ, env, clear=False):
+                first_changed = cw._ensure_shell_hook_init()
+                second_changed = cw._ensure_shell_hook_init()
+
+            self.assertTrue(first_changed)
+            self.assertFalse(second_changed)
+            content = (home / ".bashrc").read_text(encoding="utf-8")
+            self.assertEqual(content.count(cw.HOOK_BLOCK_START), 1)
 
     def test_sync_messages_with_load_warnings_disables_stale_prune(self):
         with mock.patch.object(cw, "sync_binaries", return_value=[]) as sync_mock:
@@ -2710,7 +2750,7 @@ class CommandsWrapperTests(unittest.TestCase):
             )
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
-    def test_single_cd_wrapper_binary_requires_hook_integration(self):
+    def test_single_cd_wrapper_binary_bootstraps_shell_hook_integration(self):
         if not Path("/bin/bash").is_file():
             self.skipTest("/bin/bash not available")
 
@@ -2762,11 +2802,13 @@ class CommandsWrapperTests(unittest.TestCase):
                 text=True,
             )
 
-            self.assertEqual(result.returncode, 1, result.stdout)
-            self.assertIn(
-                "single-directory wrappers require shell hook initialization",
-                result.stdout,
-            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+            bashrc = fake_home / ".bashrc"
+            self.assertTrue(bashrc.is_file())
+            bashrc_content = bashrc.read_text(encoding="utf-8")
+            self.assertIn(cw.HOOK_BLOCK_START, bashrc_content)
+            self.assertIn('eval "$(commands-wrapper hook)"', bashrc_content)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_shell_hook_changes_directory_for_single_cd_wrapper_integration(self):

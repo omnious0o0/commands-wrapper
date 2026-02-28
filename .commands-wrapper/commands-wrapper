@@ -61,6 +61,8 @@ PRIMARY_WRAPPER = "commands-wrapper"
 SHORT_ALIAS = "cw"
 LEGACY_ALIAS = "command-wrapper"
 HOOK_ACTIVE_ENV = 'COMMANDS_WRAPPER_HOOK_ACTIVE'
+HOOK_BLOCK_START = '# >>> commands-wrapper hook >>>'
+HOOK_BLOCK_END = '# <<< commands-wrapper hook <<<'
 
 DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
@@ -154,6 +156,91 @@ def _display_command_text(command_text: str) -> str:
     if _env_flag_enabled(COMMAND_OUTPUT_REDACTION_ENV):
         return _redact_command_text(command_text)
     return command_text
+
+
+def _hook_block_for_shell_init() -> str:
+    return (
+        f"{HOOK_BLOCK_START}\n"
+        f"if command -v {PRIMARY_WRAPPER} >/dev/null 2>&1; then\n"
+        f"    eval \"$({PRIMARY_WRAPPER} hook)\"\n"
+        "fi\n"
+        f"{HOOK_BLOCK_END}\n"
+    )
+
+
+def _shell_rc_candidates() -> List[str]:
+    if os.name == 'nt':
+        return []
+
+    home = os.path.expanduser('~')
+    shell_name = os.path.basename(os.environ.get('SHELL', '').strip())
+    candidates: List[str] = []
+
+    if shell_name == 'zsh':
+        candidates.append(os.path.join(home, '.zshrc'))
+    elif shell_name in ('bash', 'sh'):
+        candidates.extend([
+            os.path.join(home, '.bashrc'),
+            os.path.join(home, '.profile'),
+        ])
+    else:
+        candidates.extend([
+            os.path.join(home, '.bashrc'),
+            os.path.join(home, '.profile'),
+            os.path.join(home, '.zshrc'),
+        ])
+
+    ordered: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered.append(candidate)
+    return ordered
+
+
+def _ensure_shell_hook_init() -> bool:
+    if os.name == 'nt' or _env_flag_enabled(HOOK_ACTIVE_ENV):
+        return False
+
+    block = _hook_block_for_shell_init()
+    for rc_path in _shell_rc_candidates():
+        existing = ''
+        if os.path.exists(rc_path):
+            try:
+                with open(rc_path, encoding='utf-8') as fd:
+                    existing = fd.read()
+            except OSError:
+                continue
+
+        if HOOK_BLOCK_START in existing and HOOK_BLOCK_END in existing:
+            return False
+        if f'eval "$({PRIMARY_WRAPPER} hook)"' in existing:
+            return False
+
+        parent = os.path.dirname(rc_path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                continue
+
+        if existing and not existing.endswith('\n'):
+            updated = existing + '\n\n' + block
+        elif existing:
+            updated = existing + '\n' + block
+        else:
+            updated = block
+
+        try:
+            _atomic_write_text(rc_path, updated)
+        except OSError:
+            continue
+
+        return True
+
+    return False
 
 
 def _auto_promote_local_commands_enabled() -> bool:
@@ -2933,18 +3020,17 @@ def main():
             and len(action_parts) == 1
             and _command_uses_single_cd(cfg)
         )
+        hook_active = _env_flag_enabled(HOOK_ACTIVE_ENV)
 
-        if wrapper_single_cd and not _env_flag_enabled(HOOK_ACTIVE_ENV):
-            _error(
-                "single-directory wrappers require shell hook initialization. "
-                f"Run: eval \"$({PRIMARY_WRAPPER} hook)\" and add it to your shell config."
-            )
-            sys.exit(1)
+        if wrapper_single_cd and not hook_active:
+            _ensure_shell_hook_init()
 
         if wrapper_entry and not wrapper_single_cd:
             _apply_wrapper_cwd_context(wrapper_parent_pid)
 
-        effective_allow_single_cd_shell = allow_single_cd_shell and not wrapper_single_cd
+        effective_allow_single_cd_shell = allow_single_cd_shell and (
+            not wrapper_single_cd or not hook_active
+        )
         if effective_allow_single_cd_shell:
             exec_cmd(target_name, cfg)
         else:
