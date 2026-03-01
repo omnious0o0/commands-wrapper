@@ -602,6 +602,51 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(lookup_index["foo"], "Foo ")
         self.assertEqual(cw._resolve_command_name("foo", db, lookup_index), "Foo ")
 
+    def test_consume_first_launch_tip_uses_one_time_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker_path = Path(tmp) / "first-launch-marker"
+            with mock.patch.object(
+                cw,
+                "_first_launch_tip_marker_path",
+                return_value=str(marker_path),
+            ):
+                first = cw._consume_first_launch_tip()
+                second = cw._consume_first_launch_tip()
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+    def test_main_without_action_passes_first_launch_tip_to_wizard(self):
+        with (
+            mock.patch.object(cw, "_consume_first_launch_tip", return_value=True),
+            mock.patch.object(cw, "run_wizard") as wizard_mock,
+            mock.patch.object(sys, "argv", ["commands-wrapper"]),
+        ):
+            cw.main()
+
+        wizard_mock.assert_called_once_with(
+            startup_status=(
+                f"INFO: Tip: use '{cw.SHORT_ALIAS}' to launch "
+                f"{cw.PRIMARY_WRAPPER} from anywhere."
+            )
+        )
+
+    def test_main_update_skips_local_promotion_and_pre_sync(self):
+        with (
+            mock.patch.object(cw, "find_yamls", return_value=[]),
+            mock.patch.object(cw, "load_cmds", return_value={}),
+            mock.patch.object(cw, "_promote_local_commands_to_global") as promote_mock,
+            mock.patch.object(cw, "sync_binaries") as sync_mock,
+            mock.patch.object(cw, "_auto_update", side_effect=SystemExit(0)),
+            mock.patch.object(sys, "argv", ["commands-wrapper", "update"]),
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cw.main()
+
+        self.assertEqual(exc.exception.code, 0)
+        promote_mock.assert_not_called()
+        sync_mock.assert_not_called()
+
     def test_main_executes_case_insensitive_single_word_command(self):
         db = {
             "OAA": {
@@ -746,7 +791,10 @@ class CommandsWrapperTests(unittest.TestCase):
             mock.patch.object(sys, "argv", ["commands-wrapper", "oc"]),
             mock.patch.dict(
                 os.environ,
-                {"COMMANDS_WRAPPER_WRAPPER_ENTRY": "1"},
+                {
+                    "COMMANDS_WRAPPER_WRAPPER_ENTRY": "1",
+                    cw.HOOK_ACTIVE_ENV: "0",
+                },
                 clear=False,
             ),
         ):
@@ -916,6 +964,20 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIn("unable to send input to running command", str(exc.exception))
 
+    def test_spawn_process_wraps_process_start_failures(self):
+        with (
+            mock.patch.object(cw, "PEXPECT_AVAILABLE", False),
+            mock.patch.object(
+                cw,
+                "SubprocessProcessAdapter",
+                side_effect=OSError("spawn failed"),
+            ),
+            self.assertRaises(ValueError) as exc,
+        ):
+            cw._spawn_process("echo hi", timeout=None)
+
+        self.assertIn("unable to start command process", str(exc.exception))
+
     def test_display_command_text_is_raw_by_default(self):
         command_text = "echo token=super-secret"
         with mock.patch.dict(
@@ -1063,6 +1125,26 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertEqual(consumed, "/tmp")
         self.assertIsNone(consumed_again)
+
+    def test_apply_wrapper_cwd_context_keeps_pending_context_on_chdir_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context_path = Path(tmp) / "cwd-context.yaml"
+            with mock.patch.object(
+                cw,
+                "_wrapper_cwd_context_path",
+                return_value=str(context_path),
+            ):
+                cw._remember_wrapper_cwd_context(12345, "/not/a/real/path")
+
+                with (
+                    mock.patch.object(cw.os, "getcwd", return_value="/tmp"),
+                    mock.patch.object(cw.os, "chdir", side_effect=OSError("missing")),
+                ):
+                    cw._apply_wrapper_cwd_context(12345)
+
+                pending = cw._consume_wrapper_cwd_context(12345)
+
+        self.assertEqual(pending, "/not/a/real/path")
 
     def test_pexpect_log_sink_accepts_text_and_bytes(self):
         stream = io.StringIO()
@@ -1508,6 +1590,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "SHELL": "/bin/bash",
+                cw.HOOK_ACTIVE_ENV: "0",
             }
 
             with mock.patch.dict(os.environ, env, clear=False):
@@ -1530,6 +1613,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "SHELL": "/bin/bash",
+                cw.HOOK_ACTIVE_ENV: "0",
             }
 
             with mock.patch.dict(os.environ, env, clear=False):
@@ -2472,9 +2556,11 @@ class CommandsWrapperTests(unittest.TestCase):
             root = Path(tmp)
             fake_bin = root / "fake-bin"
             fake_user_base = root / "fake-user-base"
+            fake_home = root / "fake-home"
             work = root / "work"
             fake_bin.mkdir(parents=True)
             fake_user_base.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
             work.mkdir(parents=True)
 
             (work / "pyproject.toml").write_text(
@@ -2482,6 +2568,29 @@ class CommandsWrapperTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (work / "commands.yaml").write_text("# keep\n", encoding="utf-8")
+
+            scripts_dir = fake_user_base / "bin"
+            scripts_dir.mkdir(parents=True)
+            commands_wrapper_stub = scripts_dir / "commands-wrapper"
+            commands_wrapper_stub.write_text(
+                "#!/bin/bash\n"
+                "set -e\n"
+                'self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"\n'
+                'if [ "${1:-}" = "sync" ]; then\n'
+                "  cat <<'EOF' > \"$self_dir/cw\"\n"
+                "#!/bin/sh\n"
+                "exit 0\n"
+                "EOF\n"
+                '  chmod +x "$self_dir/cw"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "${1:-}" = "list" ] || [ "${1:-}" = "--help" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            commands_wrapper_stub.chmod(0o755)
 
             python_stub = fake_bin / "python3"
             python_stub.write_text(
@@ -2495,6 +2604,10 @@ class CommandsWrapperTests(unittest.TestCase):
                 "fi\n"
                 'if [ "$1" = "-c" ]; then\n'
                 '  code="$2"\n'
+                '  if [[ "$code" == *".config"* ]]; then\n'
+                f"    printf '%s\\n' '{fake_home}/.config/commands-wrapper'\n"
+                "    exit 0\n"
+                "  fi\n"
                 '  if [[ "$code" == *"commands-wrapper"* ]]; then\n'
                 f"    printf '%s\\n' '{fake_user_base}/bin/commands-wrapper'\n"
                 "    exit 0\n"
@@ -2502,13 +2615,18 @@ class CommandsWrapperTests(unittest.TestCase):
                 f"    printf '%s\\n' '{fake_user_base}/bin'\n"
                 "    exit 0\n"
                 "fi\n"
+                'if [ "$1" = "-" ]; then\n'
+                f"  printf '%s\\n' '{fake_home}/.config/commands-wrapper'\n"
+                "  exit 0\n"
+                "fi\n"
                 "exit 1\n",
                 encoding="utf-8",
             )
             python_stub.chmod(python_stub.stat().st_mode | stat.S_IEXEC)
 
             env = os.environ.copy()
-            env["PATH"] = str(fake_bin)
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HOME"] = str(fake_home)
 
             result = subprocess.run(
                 ["/bin/bash", str(install_script)],
@@ -2522,6 +2640,9 @@ class CommandsWrapperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertNotIn("curl not found", result.stdout)
             self.assertNotIn("tar not found", result.stdout)
+            self.assertIn(
+                "commands-wrapper is installed and self-healed.", result.stdout
+            )
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_install_sh_remote_source_requires_mktemp(self):
@@ -2584,9 +2705,11 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$pyExitCode -eq 0", content)
         self.assertIn("$pythonExitCode -eq 0", content)
         self.assertIn("$LASTEXITCODE -ne 0", content)
+        self.assertIn("function Normalize-PathSafe", content)
         self.assertIn("function Get-PythonScriptsDir", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
         self.assertIn("function Test-CommandsWrapperSourceRoot", content)
+        self.assertIn("-ExpectedDir $scriptsDir", content)
         self.assertIn(".commands-wrapper", content)
         self.assertIn("COMMANDS_WRAPPER_SOURCE_URL", content)
         self.assertIn("COMMANDS_WRAPPER_SOURCE_SHA256", content)
@@ -2665,7 +2788,130 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, 7)
         error_mock.assert_called_once_with("update failed with exit code 7")
 
-    def test_prepare_update_source_without_hash_uses_default_url(self):
+    def test_auto_update_restores_command_files_when_update_modifies_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands_file = Path(tmp) / "commands.yaml"
+            original = (
+                'demo:\n  description: before\n  steps:\n    - command: "echo before"\n'
+            )
+            commands_file.write_text(original, encoding="utf-8")
+
+            def mutate_command_file(_args, suppress_output=False):
+                commands_file.write_text(
+                    'demo:\n  description: changed\n  steps:\n    - command: "echo changed"\n',
+                    encoding="utf-8",
+                )
+                return 0
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"COMMANDS_WRAPPER_UPDATE_SHA256": ""},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    cw,
+                    "_prepare_update_source",
+                    return_value=(cw.UPDATE_TARBALL_URL, None),
+                ),
+                mock.patch.object(cw, "find_yamls", return_value=[str(commands_file)]),
+                mock.patch.object(cw, "_run_pip", side_effect=mutate_command_file),
+                mock.patch.object(cw, "_load_commands_for_sync", return_value=({}, [])),
+                mock.patch.object(
+                    cw, "_sync_messages_with_load_warnings", return_value=[]
+                ),
+                mock.patch.object(cw, "_report_sync_messages", return_value=False),
+                mock.patch.object(cw, "_ok") as ok_mock,
+                mock.patch.object(cw, "_error") as error_mock,
+                self.assertRaises(SystemExit) as exc,
+            ):
+                cw._auto_update()
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertEqual(commands_file.read_text(encoding="utf-8"), original)
+            ok_mock.assert_not_called()
+            self.assertIn(
+                "update unexpectedly modified command files",
+                error_mock.call_args[0][0],
+            )
+
+    def test_auto_update_restores_command_files_even_when_sync_reports_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands_file = Path(tmp) / "commands.yaml"
+            original = (
+                'demo:\n  description: before\n  steps:\n    - command: "echo before"\n'
+            )
+            commands_file.write_text(original, encoding="utf-8")
+
+            def mutate_command_file(_args, suppress_output=False):
+                commands_file.write_text(
+                    'demo:\n  description: changed\n  steps:\n    - command: "echo changed"\n',
+                    encoding="utf-8",
+                )
+                return 0
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"COMMANDS_WRAPPER_UPDATE_SHA256": ""},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    cw,
+                    "_prepare_update_source",
+                    return_value=(cw.UPDATE_TARBALL_URL, None),
+                ),
+                mock.patch.object(cw, "find_yamls", return_value=[str(commands_file)]),
+                mock.patch.object(cw, "_run_pip", side_effect=mutate_command_file),
+                mock.patch.object(cw, "_load_commands_for_sync", return_value=({}, [])),
+                mock.patch.object(
+                    cw,
+                    "_sync_messages_with_load_warnings",
+                    return_value=["failed to write wrapper 'x': denied"],
+                ),
+                mock.patch.object(cw, "_report_sync_messages", return_value=True),
+                mock.patch.object(cw, "_ok") as ok_mock,
+                mock.patch.object(cw, "_error") as error_mock,
+                self.assertRaises(SystemExit) as exc,
+            ):
+                cw._auto_update()
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertEqual(commands_file.read_text(encoding="utf-8"), original)
+            ok_mock.assert_not_called()
+            self.assertIn(
+                "update unexpectedly modified command files",
+                error_mock.call_args[0][0],
+            )
+
+    def test_detect_unexpected_command_file_changes_reports_created_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands_file = Path(tmp) / "commands.yaml"
+            snapshots = cw._snapshot_command_files([str(commands_file)])
+            commands_file.write_text(
+                'demo:\n  description: created\n  steps:\n    - command: "echo created"\n',
+                encoding="utf-8",
+            )
+
+            changed, created = cw._detect_unexpected_command_file_changes(snapshots)
+
+        self.assertEqual(changed, [])
+        self.assertEqual(created, [str(commands_file)])
+
+    def test_restore_command_file_snapshots_removes_created_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            commands_file = Path(tmp) / "commands.yaml"
+            snapshots = cw._snapshot_command_files([str(commands_file)])
+            commands_file.write_text("demo: {}\n", encoding="utf-8")
+
+            cw._restore_command_file_snapshots(
+                snapshots,
+                created_files=[str(commands_file)],
+            )
+
+            self.assertFalse(commands_file.exists())
+
+    def test_prepare_update_source_without_hash_uses_configured_update_url(self):
         with mock.patch.dict(
             os.environ,
             {"COMMANDS_WRAPPER_UPDATE_SHA256": ""},
@@ -2675,6 +2921,56 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertEqual(source, cw.UPDATE_TARBALL_URL)
         self.assertIsNone(cleanup)
+
+    def test_auto_update_restores_new_yaml_created_in_local_command_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp) / ".commands-wrapper"
+            local_dir.mkdir(parents=True)
+            created_yaml = local_dir / "generated-after-update.yaml"
+
+            def create_new_local_yaml(_args, suppress_output=False):
+                created_yaml.write_text(
+                    'demo:\n  description: generated\n  steps:\n    - command: "echo generated"\n',
+                    encoding="utf-8",
+                )
+                return 0
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"COMMANDS_WRAPPER_UPDATE_SHA256": ""},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    cw,
+                    "_prepare_update_source",
+                    return_value=(cw.UPDATE_TARBALL_URL, None),
+                ),
+                mock.patch.object(cw, "_command_file_snapshot_paths", return_value=[]),
+                mock.patch.object(
+                    cw,
+                    "_command_file_inventory_directories",
+                    return_value=[str(local_dir)],
+                ),
+                mock.patch.object(cw, "_run_pip", side_effect=create_new_local_yaml),
+                mock.patch.object(cw, "_load_commands_for_sync", return_value=({}, [])),
+                mock.patch.object(
+                    cw, "_sync_messages_with_load_warnings", return_value=[]
+                ),
+                mock.patch.object(cw, "_report_sync_messages", return_value=False),
+                mock.patch.object(cw, "_ok") as ok_mock,
+                mock.patch.object(cw, "_error") as error_mock,
+                self.assertRaises(SystemExit) as exc,
+            ):
+                cw._auto_update()
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertFalse(created_yaml.exists())
+            ok_mock.assert_not_called()
+            self.assertIn(
+                "update unexpectedly modified command files",
+                error_mock.call_args[0][0],
+            )
 
     def test_auto_update_rejects_invalid_sha_override(self):
         with (
@@ -2690,8 +2986,36 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertEqual(exc.exception.code, 1)
         error_mock.assert_called_once_with(
-            "invalid COMMANDS_WRAPPER_UPDATE_SHA256 value"
+            "invalid COMMANDS_WRAPPER_UPDATE_SHA256 value (expected 64 lowercase hex characters)"
         )
+
+    def test_prepare_update_source_checksum_mismatch_includes_context(self):
+        class _FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"COMMANDS_WRAPPER_UPDATE_SHA256": "0" * 64},
+                clear=False,
+            ),
+            mock.patch.object(
+                cw.urllib.request,
+                "urlopen",
+                return_value=_FakeResponse(b"checksum-mismatch"),
+            ),
+            self.assertRaises(ValueError) as exc,
+        ):
+            cw._prepare_update_source()
+
+        message = str(exc.exception)
+        self.assertIn("update archive checksum mismatch", message)
+        self.assertIn("expected", message)
+        self.assertIn("got", message)
 
     def test_pip_uninstall_exits_zero_when_package_absent(self):
         with (
@@ -2718,7 +3042,10 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$LASTEXITCODE -ne 0", content)
         self.assertIn("$syncWarning", content)
         self.assertIn("function Get-PythonScriptsDir", content)
+        self.assertIn("function Test-PackageInstalled", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
+        self.assertIn('"pip", "show", "commands-wrapper"', content)
+        self.assertIn("commands-wrapper is not installed.", content)
         self.assertIn("commands-wrapper.exe", content)
         self.assertNotIn("commands-wrapper sync --uninstall", content)
 
@@ -2739,11 +3066,26 @@ class CommandsWrapperTests(unittest.TestCase):
             )
             _write_executable(
                 fake_bin / "python",
-                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\n"
+                'if [ "$1" = "-c" ]; then\n'
+                f"  printf '%s\\n' '{fake_bin}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
             )
             _write_executable(
                 fake_bin / "commands-wrapper",
-                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\n"
+                "set -e\n"
+                'self_dir="$(cd -- "$(dirname -- "$0")" && pwd)"\n'
+                'if [ "${1:-}" = "sync" ]; then\n'
+                '  printf "@echo off\\n" > "$self_dir/cw.cmd"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "${1:-}" = "list" ] || [ "${1:-}" = "--help" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
             )
 
             env = os.environ.copy()
@@ -2759,7 +3101,9 @@ class CommandsWrapperTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout)
-            self.assertIn("commands-wrapper installed.", result.stdout)
+            self.assertIn(
+                "commands-wrapper is installed and self-healed.", result.stdout
+            )
 
     @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
     def test_install_ps1_warns_on_nonzero_sync_exit(self):
@@ -2778,7 +3122,12 @@ class CommandsWrapperTests(unittest.TestCase):
             )
             _write_executable(
                 fake_bin / "python",
-                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\n"
+                'if [ "$1" = "-c" ]; then\n'
+                f"  printf '%s\\n' '{fake_bin}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
             )
             _write_executable(
                 fake_bin / "commands-wrapper",
@@ -2797,11 +3146,70 @@ class CommandsWrapperTests(unittest.TestCase):
                 text=True,
             )
 
-            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(
-                "Installed, but wrapper sync needs a new shell session.",
+                "automatic wrapper sync failed after retry",
                 result.stdout,
             )
+
+    @unittest.skipIf(shutil.which("pwsh") is None, "pwsh is not available")
+    def test_uninstall_ps1_checks_python_after_py_reports_not_installed(self):
+        uninstall_ps1 = SCRIPT_PATH.parent / "uninstall.ps1"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            work = root / "work"
+            fake_bin.mkdir(parents=True)
+            work.mkdir(parents=True)
+
+            _write_executable(
+                fake_bin / "py",
+                "#!/bin/sh\n"
+                'if [ "$1" = "-3" ]; then shift; fi\n'
+                'if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "show" ]; then\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "uninstall" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "-c" ]; then\n'
+                f"  printf '%s\\n' '{fake_bin}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+            )
+            _write_executable(
+                fake_bin / "python",
+                "#!/bin/sh\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "show" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "-m" ] && [ "$2" = "pip" ] && [ "$3" = "uninstall" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "-c" ]; then\n'
+                f"  printf '%s\\n' '{fake_bin}'\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+            )
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-File", str(uninstall_ps1)],
+                cwd=str(work),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("commands-wrapper uninstalled.", result.stdout)
+            self.assertNotIn("commands-wrapper is not installed.", result.stdout)
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_single_cd_wrapper_binary_bootstraps_shell_hook_integration(self):
@@ -2849,6 +3257,7 @@ class CommandsWrapperTests(unittest.TestCase):
             env["XDG_CONFIG_HOME"] = str(fake_xdg)
             env["PYTHONUSERBASE"] = str(fake_user_base)
             env["PATH"] = f"{fake_bin}:{fake_user_base}/bin:/usr/bin:/bin"
+            env[cw.HOOK_ACTIVE_ENV] = "0"
 
             command = f"cd {shlex.quote(str(root))}; oc"
             result = subprocess.run(
