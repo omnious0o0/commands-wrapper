@@ -142,6 +142,132 @@ else:
     return Invoke-PythonCapture @("-c", $code)
 }
 
+function Get-InstalledPackageVersion {
+    $code = @'
+import subprocess
+import sys
+
+result = subprocess.run(
+    [sys.executable, "-m", "pip", "show", "commands-wrapper"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+)
+if result.returncode != 0:
+    raise SystemExit(0)
+
+for line in result.stdout.splitlines():
+    if line.startswith("Version:"):
+        print(line.split(":", 1)[1].strip())
+        break
+'@
+
+    return Invoke-PythonCapture @("-c", $code)
+}
+
+function Get-ProjectVersionFromPyproject {
+    param([string]$RootPath)
+
+    if (-not $RootPath) {
+        return $null
+    }
+
+    $pyprojectPath = Join-Path $RootPath "pyproject.toml"
+    if (-not (Test-Path $pyprojectPath)) {
+        return $null
+    }
+
+    $code = @'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(0)
+
+text = path.read_text(encoding="utf-8", errors="replace")
+version = None
+
+try:
+    import tomllib
+except Exception:
+    tomllib = None
+
+if tomllib is not None:
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        data = {}
+    project = data.get("project") if isinstance(data, dict) else None
+    if isinstance(project, dict):
+        value = project.get("version")
+        if isinstance(value, str) and value.strip():
+            version = value.strip()
+
+if version is None:
+    in_project = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_project = stripped == "[project]"
+            continue
+        if not in_project:
+            continue
+        match = re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', stripped)
+        if match:
+            version = match.group(1).strip()
+            break
+
+if version:
+    print(version)
+'@
+
+    return Invoke-PythonCapture @("-c", $code, $pyprojectPath)
+}
+
+function Compare-PackageVersion {
+    param(
+        [string]$InstalledVersion,
+        [string]$TargetVersion
+    )
+
+    if (-not $InstalledVersion -or -not $TargetVersion) {
+        return "unknown"
+    }
+
+    $code = @'
+import sys
+
+installed = sys.argv[1]
+target = sys.argv[2]
+
+try:
+    from packaging.version import Version
+    installed_v = Version(installed)
+    target_v = Version(target)
+except Exception:
+    if installed == target:
+        print("eq")
+    else:
+        print("unknown")
+    raise SystemExit(0)
+
+if installed_v == target_v:
+    print("eq")
+elif installed_v > target_v:
+    print("gt")
+else:
+    print("lt")
+'@
+
+    $result = Invoke-PythonCapture @("-c", $code, $InstalledVersion, $TargetVersion)
+    if (-not $result) {
+        return "unknown"
+    }
+    return $result
+}
+
 function Resolve-WrapperSyncCommand {
     param([string]$ScriptsDir)
 
@@ -394,10 +520,13 @@ Complete-Step
 
 Start-Step "Preparing installation source"
 $tempArchive = $null
+$installTargetRoot = $null
 if ($repoSourceRoot) {
     $installTarget = $repoSourceRoot
+    $installTargetRoot = $repoSourceRoot
 } elseif ($cwdSourceRoot) {
     $installTarget = $cwdSourceRoot
+    $installTargetRoot = $cwdSourceRoot
 } else {
     if ($sourceSha256) {
         $tempArchive = Join-Path ([System.IO.Path]::GetTempPath()) ("commands-wrapper-" + [guid]::NewGuid().ToString() + ".tar.gz")
@@ -414,7 +543,16 @@ if ($repoSourceRoot) {
 Complete-Step
 
 Start-Step "Installing/updating package"
-Invoke-Python @("-m", "pip", "install", "--upgrade", "--force-reinstall", $installTarget)
+$installedVersion = Get-InstalledPackageVersion
+$targetVersion = Get-ProjectVersionFromPyproject -RootPath $installTargetRoot
+$relation = Compare-PackageVersion -InstalledVersion $installedVersion -TargetVersion $targetVersion
+if ($relation -eq "eq") {
+    Warn-Step "commands-wrapper $installedVersion is already installed; skipping package reinstall."
+} elseif ($relation -eq "gt") {
+    Warn-Step "installed version $installedVersion is newer than source $targetVersion; skipping downgrade."
+} else {
+    Invoke-Python @("-m", "pip", "install", "--upgrade", $installTarget)
+}
 Complete-Step
 
 if ($tempArchive -and (Test-Path $tempArchive)) {

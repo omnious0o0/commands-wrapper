@@ -7,10 +7,12 @@ Wraps multi-step shell sequences into a single named command. Use it to rename l
 ## Installation
 
 ```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh
-bash install.sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh && bash install.sh
+```
 
-# then run it using
+After install, run:
+
+```bash
 cw # or commands-wrapper
 ```
 

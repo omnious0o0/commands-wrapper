@@ -13,6 +13,8 @@ SHORT_ALIAS="cw"
 
 PATH_BLOCK_START='# >>> commands-wrapper path >>>'
 PATH_BLOCK_END='# <<< commands-wrapper path <<<'
+FISH_PATH_BLOCK_START='# >>> commands-wrapper fish path >>>'
+FISH_PATH_BLOCK_END='# <<< commands-wrapper fish path <<<'
 
 TOTAL_STEPS=9
 CURRENT_STEP=0
@@ -138,6 +140,27 @@ path_has_dir() {
     esac
 }
 
+resolved_command_path() {
+    local command_name="$1"
+    type -P "$command_name" 2>/dev/null || true
+}
+
+assert_global_command_path() {
+    local command_name="$1"
+    local expected_dir="$2"
+    local resolved
+    resolved="$(resolved_command_path "$command_name")"
+    if [ -z "$resolved" ]; then
+        die "global access check failed: '$command_name' is not discoverable in PATH."
+    fi
+
+    local resolved_dir
+    resolved_dir="$(dirname "$resolved")"
+    if [ "$resolved_dir" != "$expected_dir" ]; then
+        die "global access check failed: '$command_name' resolves to '$resolved' instead of '$expected_dir'."
+    fi
+}
+
 path_block_for_bin_dir() {
     local bin_dir="$1"
     printf '%s\n' \
@@ -153,7 +176,19 @@ path_block_for_bin_dir() {
 
 build_updated_path_block_content() {
     local block="$1"
-    python3 - "$PATH_BLOCK_START" "$PATH_BLOCK_END" "$block" <<'PY'
+    build_updated_block_content "$PATH_BLOCK_START" "$PATH_BLOCK_END" "$block"
+}
+
+build_updated_fish_path_block_content() {
+    local block="$1"
+    build_updated_block_content "$FISH_PATH_BLOCK_START" "$FISH_PATH_BLOCK_END" "$block"
+}
+
+build_updated_block_content() {
+    local start_marker="$1"
+    local end_marker="$2"
+    local block="$3"
+    python3 - "$start_marker" "$end_marker" "$block" <<'PY'
 import re
 import sys
 
@@ -172,6 +207,152 @@ else:
         updated = block + "\n"
 
 sys.stdout.write(updated)
+PY
+}
+
+fish_path_block_for_bin_dir() {
+    local bin_dir="$1"
+    printf '%s\n' \
+        "$FISH_PATH_BLOCK_START" \
+        "if test -d \"$bin_dir\"" \
+        "    if not contains \"$bin_dir\" \$PATH" \
+        "        set -gx PATH \"$bin_dir\" \$PATH" \
+        "    end" \
+        "end" \
+        "$FISH_PATH_BLOCK_END"
+}
+
+append_fish_path_block() {
+    local fish_conf_path="$1"
+    local block="$2"
+    local existing=""
+
+    if [ -f "$fish_conf_path" ]; then
+        if ! existing="$(<"$fish_conf_path")"; then
+            existing=""
+        fi
+    fi
+
+    local parent
+    parent="$(dirname "$fish_conf_path")"
+    if [ -n "$parent" ]; then
+        mkdir -p "$parent" || return 1
+    fi
+
+    local updated
+    if ! updated="$(printf '%s' "$existing" | build_updated_fish_path_block_content "$block")"; then
+        return 1
+    fi
+
+    if [ "$updated" = "$existing" ]; then
+        return 0
+    fi
+
+    printf '%s' "$updated" > "$fish_conf_path" || return 1
+    return 0
+}
+
+ensure_fish_path_persistence() {
+    local bin_dir="$1"
+    local fish_conf_path="$HOME/.config/fish/conf.d/commands-wrapper.fish"
+    local fish_block
+    fish_block="$(fish_path_block_for_bin_dir "$bin_dir")"
+
+    if append_fish_path_block "$fish_conf_path" "$fish_block"; then
+        printf '%s\n' "$fish_conf_path"
+        return 0
+    fi
+
+    return 1
+}
+
+installed_package_version() {
+    python3 -m pip show commands-wrapper 2>/dev/null | python3 - <<'PY'
+import sys
+
+for line in sys.stdin:
+    if line.startswith('Version:'):
+        print(line.split(':', 1)[1].strip())
+        break
+PY
+}
+
+project_version_from_pyproject() {
+    local pyproject_path="$1"
+    python3 - "$pyproject_path" <<'PY'
+import pathlib
+import re
+import sys
+
+pyproject_path = pathlib.Path(sys.argv[1])
+if not pyproject_path.is_file():
+    sys.exit(0)
+
+text = pyproject_path.read_text(encoding='utf-8', errors='replace')
+
+try:
+    import tomllib  # type: ignore[attr-defined]
+except Exception:
+    tomllib = None
+
+version = None
+if tomllib is not None:
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        data = {}
+    project = data.get('project') if isinstance(data, dict) else None
+    if isinstance(project, dict):
+        value = project.get('version')
+        if isinstance(value, str) and value.strip():
+            version = value.strip()
+
+if version is None:
+    in_project = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_project = stripped == '[project]'
+            continue
+        if not in_project:
+            continue
+        match = re.match(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', stripped)
+        if match:
+            version = match.group(1).strip()
+            break
+
+if version:
+    print(version)
+PY
+}
+
+compare_versions() {
+    local left="$1"
+    local right="$2"
+    python3 - "$left" "$right" <<'PY'
+import sys
+
+left = sys.argv[1]
+right = sys.argv[2]
+
+try:
+    from packaging.version import Version
+
+    left_v = Version(left)
+    right_v = Version(right)
+except Exception:
+    if left == right:
+        print('eq')
+        raise SystemExit(0)
+    print('unknown')
+    raise SystemExit(0)
+
+if left_v == right_v:
+    print('eq')
+elif left_v > right_v:
+    print('gt')
+else:
+    print('lt')
 PY
 }
 
@@ -350,9 +531,25 @@ else
 fi
 step_ok
 
+TARGET_VERSION="$(project_version_from_pyproject "$(pwd)/pyproject.toml" || true)"
+INSTALLED_VERSION="$(installed_package_version || true)"
+
 start_step "Installing/updating package"
-if ! run_pip install --upgrade --force-reinstall .; then
-    die "pip install failed while installing commands-wrapper."
+if [ -n "$INSTALLED_VERSION" ] && [ -n "$TARGET_VERSION" ]; then
+    VERSION_RELATION="$(compare_versions "$INSTALLED_VERSION" "$TARGET_VERSION")"
+    if [ "$VERSION_RELATION" = "eq" ]; then
+        step_warn "commands-wrapper $INSTALLED_VERSION is already installed; skipping package reinstall."
+    elif [ "$VERSION_RELATION" = "gt" ]; then
+        step_warn "installed version $INSTALLED_VERSION is newer than source $TARGET_VERSION; skipping downgrade."
+    else
+        if ! run_pip install --upgrade .; then
+            die "pip install failed while installing commands-wrapper."
+        fi
+    fi
+else
+    if ! run_pip install --upgrade .; then
+        die "pip install failed while installing commands-wrapper."
+    fi
 fi
 step_ok
 
@@ -385,15 +582,15 @@ PATH_RC_FILE=""
 if PATH_RC_FILE="$(ensure_path_persistence "$BIN_DIR")"; then
     step_warn "PATH self-heal persisted to $PATH_RC_FILE"
 fi
+FISH_PATH_FILE=""
+if FISH_PATH_FILE="$(ensure_fish_path_persistence "$BIN_DIR")"; then
+    step_warn "Fish PATH self-heal persisted to $FISH_PATH_FILE"
+fi
 if ! path_has_dir "$BIN_DIR"; then
     export PATH="$BIN_DIR:$PATH"
 fi
-if ! command -v "$PRIMARY_WRAPPER" >/dev/null 2>&1; then
-    die "global access check failed: '$PRIMARY_WRAPPER' is still not discoverable in PATH."
-fi
-if ! command -v "$SHORT_ALIAS" >/dev/null 2>&1; then
-    die "global access check failed: '$SHORT_ALIAS' is still not discoverable in PATH."
-fi
+assert_global_command_path "$PRIMARY_WRAPPER" "$BIN_DIR"
+assert_global_command_path "$SHORT_ALIAS" "$BIN_DIR"
 step_ok
 
 start_step "Ensuring global command config exists"
