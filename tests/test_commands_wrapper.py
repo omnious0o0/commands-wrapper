@@ -2721,6 +2721,8 @@ class CommandsWrapperTests(unittest.TestCase):
 
         self.assertIn("sysconfig.get_path('scripts')", content)
         self.assertIn("COMMANDS_WRAPPER_SOURCE_SHA256", content)
+        self.assertIn("FISH_PATH_BLOCK_START", content)
+        self.assertIn("compare_versions", content)
         self.assertNotIn(
             "run_pip uninstall commands-wrapper -y &>/dev/null || true", content
         )
@@ -2730,8 +2732,20 @@ class CommandsWrapperTests(unittest.TestCase):
         content = uninstall_sh.read_text(encoding="utf-8")
 
         self.assertIn("failed to uninstall commands-wrapper.", content)
+        self.assertIn("Continue and uninstall commands-wrapper?", content)
+        self.assertIn("COMMANDS_WRAPPER_UNINSTALL_FORCE", content)
+        self.assertIn("COMMANDS_WRAPPER_REMOVE_CONFIG", content)
         self.assertNotIn(
             "run_pip uninstall commands-wrapper -y &>/dev/null || true", content
+        )
+
+    def test_readme_installer_entrypoint_uses_single_curl_and_bash_command(self):
+        readme = Path(__file__).resolve().parents[1] / "README.md"
+        content = readme.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh && bash install.sh",
+            content,
         )
 
     def test_auto_update_retries_with_diagnostics_after_initial_failure(self):
@@ -3042,9 +3056,13 @@ class CommandsWrapperTests(unittest.TestCase):
         self.assertIn("$LASTEXITCODE -ne 0", content)
         self.assertIn("$syncWarning", content)
         self.assertIn("function Get-PythonScriptsDir", content)
+        self.assertIn("function Confirm-Action", content)
+        self.assertIn("function Remove-UserPathEntry", content)
         self.assertIn("function Test-PackageInstalled", content)
         self.assertIn("function Resolve-WrapperSyncCommand", content)
         self.assertIn('"pip", "show", "commands-wrapper"', content)
+        self.assertIn("COMMANDS_WRAPPER_UNINSTALL_FORCE", content)
+        self.assertIn("COMMANDS_WRAPPER_REMOVE_CONFIG", content)
         self.assertIn("commands-wrapper is not installed.", content)
         self.assertIn("commands-wrapper.exe", content)
         self.assertNotIn("commands-wrapper sync --uninstall", content)
@@ -3197,6 +3215,7 @@ class CommandsWrapperTests(unittest.TestCase):
 
             env = os.environ.copy()
             env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["COMMANDS_WRAPPER_UNINSTALL_FORCE"] = "1"
 
             result = subprocess.run(
                 ["pwsh", "-NoProfile", "-File", str(uninstall_ps1)],
