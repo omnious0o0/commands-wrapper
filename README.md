@@ -1,120 +1,80 @@
 # commands-wrapper
 
-## What it does
+Wraps multi-step shell sequences into a single named command. Use it to rename long commands into short ones, or chain multiple steps together into one.
 
-commands-wrapper wraps multi-step shell sequences into a single named command.
-
-It can be used to simply rename commands, or craft a command that performs multiple commands and steps using a single named command.
-
-## Usage examples
-
-How I personally like to use it:
-
-1. renaming a command
-instead of `cd <directory path>`, I make a simple command like `OAA` to navigate to that directory without me having to manually type the entire path or even memorize it.
-
-2. crafting a command
-
+---
 
 ## Installation
-
-### Linux / macOS
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.sh
 bash install.sh
-rm -f install.sh
+
+# then run it using
+cw # or commands-wrapper
 ```
-
-If your environment requires stricter controls, review `install.sh` before running it.
-
-Optional environment variables for the shell installer:
-- `COMMANDS_WRAPPER_SOURCE_URL` to override the source tarball URL.
-- `COMMANDS_WRAPPER_SOURCE_SHA256` to enforce SHA-256 verification of that tarball.
-
-### Windows (PowerShell)
-
-```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/omnious0o0/commands-wrapper/main/.commands-wrapper/install.ps1" -OutFile "install.ps1"
-powershell -ExecutionPolicy Bypass -File .\install.ps1
-Remove-Item .\install.ps1
-```
-
-Optional environment variables for the PowerShell installer:
-- `COMMANDS_WRAPPER_SOURCE_URL` to override the source URL passed to `pip install`.
-- `COMMANDS_WRAPPER_SOURCE_SHA256` to enforce SHA-256 verification when a remote archive is downloaded first.
-
-### pip (all OS, from GitHub source)
-
-```bash
-python -m pip install "commands-wrapper @ https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
-```
-
-`commands-wrapper` is currently distributed from GitHub source (not PyPI).
 
 ## Usage
 
-### Interactive mode
-
+run
 ```bash
-commands-wrapper configure
+cw # or commands-wrapper
 ```
+to enter interactive mode.
 
-If a full TUI is unavailable in the current shell, the command falls back to non-interactive guidance.
+It's very simple, controls are simply:
+- `arrow keys` to navigate (alternatively `j` and `k`)
+- `enter` to select
+- `esc` to exit
 
-The TUI opens directly into your command list for quick editing:
-- `+ Add new command` is always shown at the top.
-- Press `Enter` on any command row to rename it, edit metadata, edit steps, or delete it.
-- Existing steps support direct content editing (not just move/delete).
-- `Refresh list` and `Exit` are available in the same screen.
+From the TUI you can:
+- Add a new command (`+ Add new command` is pinned at the top)
+- Press `Enter` on any command to rename it, edit its metadata, edit steps, or delete it
+- Edit step content directly, not just move or delete
+- Refresh the list or exit from the same screen
 
-Command definitions are discovered from:
-- Current working directory (`commands.yaml`, `commands.yml`, local `.commands-wrapper/*.{yml,yaml}`, and local `commands-wrapper/*.{yml,yaml}`)
-- User config directories (`%APPDATA%\commands-wrapper` on Windows, `$XDG_CONFIG_HOME/commands-wrapper` or `~/.config/commands-wrapper` on Linux/macOS, plus legacy `~/.commands-wrapper`)
+**Where commands are loaded from:**
+- Current directory: `commands.yaml`, `commands.yml`, local `.commands-wrapper/*.{yml,yaml}`, and local `commands-wrapper/*.{yml,yaml}`
+- User config: `%APPDATA%\commands-wrapper` on Windows, `$XDG_CONFIG_HOME/commands-wrapper` or `~/.config/commands-wrapper` on Linux/macOS, plus the legacy `~/.commands-wrapper` path
 
-When command names overlap, local project definitions take precedence over user/global definitions.
+When the same command name exists in both places, the local project definition wins.
 
-New commands are written to your user config path by default so they persist across directories and restarts.
-Set `COMMANDS_WRAPPER_PREFER_LOCAL_WRITE=1` if you want new commands to target the current directory config file first.
-By default, local commands discovered in the current directory are promoted to your user config so they stay available outside that directory.
-Set `COMMANDS_WRAPPER_AUTO_PROMOTE_LOCAL=0` to disable that promotion behavior.
+New commands are saved to your user config by default so they persist across directories. Set `COMMANDS_WRAPPER_PREFER_LOCAL_WRITE=1` to write to the current directory's config file instead.
 
-### YAML format
+By default, local commands found in the current directory are promoted to your user config so they stay available everywhere. Set `COMMANDS_WRAPPER_AUTO_PROMOTE_LOCAL=0` to turn that off.
+
+---
+
+## YAML format
 
 ```yaml
 command-name:
-  description: "Description of the command"
-  steps 60:
-    - command: "command to run"
-    - send: "text to send to the command"
+  description: "What this command does"
+  steps:
+    - command: "shell command to run"
+    - send: "text to send to the process"
     - press_key: "key to press"
-    - wait: "time to wait"
+    - wait: "seconds to wait"
 ```
 
-`cd` commands are handled specially:
-- `- command: "cd /some/path"` updates the working directory for following steps.
-- Running `commands-wrapper <name>` directly still opens an interactive shell for
-  single-`cd` wrappers.
-- Running generated wrapper executables for single-`cd` commands auto-bootstrap
-  shell hook initialization when needed.
-- With `eval "$(commands-wrapper hook)"` enabled, single-`cd` wrappers change the
-  current shell directory directly and chains like `oc && dev` work in one shell.
+A `cd` step updates the working directory for all steps that follow it. Running a single-`cd` wrapper directly opens an interactive shell at that path. With `eval "$(commands-wrapper hook)"` active, it changes the current shell directory instead, so chaining like `oc && dev` works as expected.
 
-Example:
+**Example:**
 
 ```yaml
 system --update:
   description: "Quick system update"
-  steps 60:
+  steps:
     - command: "sudo apt-get update && sudo apt-get upgrade -y"
 ```
 
-Avoid storing secrets (passwords, tokens, keys) in command YAML files. Prefer interactive prompts or environment-based secrets.
-Set `COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT=1` to redact likely secret values from printed command previews and command-failure messages.
+> Avoid storing secrets (passwords, tokens, keys) in YAML files. Use interactive prompts or environment variables instead. Set `COMMANDS_WRAPPER_REDACT_COMMAND_OUTPUT=1` to redact likely secret values from printed output and failure messages.
+
+---
 
 ## Commands
 
-> Tip: `cw` is a generated wrapper command (shim) for `commands-wrapper`
+> `cw` is a generated shim for `commands-wrapper`
 
 ### Configure
 
@@ -148,24 +108,22 @@ commands-wrapper remove <command-name>
 commands-wrapper remove "command name"
 ```
 
-### Wrapper sync
+### Sync wrappers
 
-Wrapper generation and cleanup are automatic whenever commands-wrapper runs or when
-you add/edit/remove commands.
+Wrapper generation and cleanup happen automatically whenever commands-wrapper runs or when you add, edit, or remove a command. Running `sync` explicitly triggers a stale-wrapper cleanup pass.
 
-Automatic sync keeps wrappers up to date but does not prune stale wrappers. Use `commands-wrapper sync`
-when you want an explicit stale-wrapper cleanup pass.
+```bash
+commands-wrapper sync
+```
 
-If a generated naked wrapper name conflicts with an existing command on your `PATH`,
-commands-wrapper skips that wrapper and prints a warning. Use:
+If a generated wrapper name conflicts with an existing command on your `PATH`, commands-wrapper skips that wrapper and prints a warning. In that case, run the command directly with:
 
 ```bash
 cw <command-name>
 commands-wrapper <command-name>
 ```
 
-Command matching is case-insensitive. Commands that differ only by case (for example `Foo` and `foo`) are rejected to avoid ambiguity.
-For naked wrappers on case-sensitive filesystems, commands that contain uppercase letters also generate a preserved-case alias wrapper (for example both `oaa` and `OAA`).
+Command matching is case-insensitive. Commands that differ only by case (like `Foo` and `foo`) are rejected to avoid ambiguity. On case-sensitive filesystems, commands with uppercase letters also get a preserved-case alias wrapper.
 
 ### Update
 
@@ -174,34 +132,61 @@ commands-wrapper update
 commands-wrapper upd
 ```
 
-Optional environment variables for update:
-- `COMMANDS_WRAPPER_UPDATE_URL` to override the update source URL.
-- `COMMANDS_WRAPPER_UPDATE_SHA256` to enforce SHA-256 verification before install.
+**Optional environment variables:**
+- `COMMANDS_WRAPPER_UPDATE_URL` — override the update source URL
+- `COMMANDS_WRAPPER_UPDATE_SHA256` — enforce SHA-256 verification before install
 
-### Hook output for shell init
+### Shell hook
 
 ```bash
 commands-wrapper hook
 ```
 
-On POSIX shells, hook output uses shell functions for wrapper names that are
-valid function identifiers. This allows single-`cd` wrappers to change the current
-shell directory directly (instead of opening a nested shell), so chaining like
-`oc && dev` works as expected after hook initialization.
-
-Typical shell init usage:
+Outputs shell initialization code. Add it to your shell config:
 
 ```bash
 eval "$(commands-wrapper hook)"
 ```
 
-Wrapper names that are not valid shell function identifiers remain aliases.
+On POSIX shells, the hook uses shell functions for valid function identifier names, allowing single-`cd` wrappers to change the current shell directory directly. Wrapper names that are not valid function identifiers are set up as aliases instead.
 
 ### Uninstall
 
 ```bash
 commands-wrapper --uninstall
 ```
+
+---
+
+## Usage examples
+
+**Shortcut a long path:**
+
+```yaml
+oc:
+  description: "Open projects folder"
+  steps:
+    - command: "cd /home/user/Storage/Projects"
+```
+
+**Chain steps together:**
+
+```yaml
+deploy:
+  description: "Build and deploy"
+  steps:
+    - command: "python build.py"
+    - wait: "3"
+    - command: "python deploy.py"
+```
+
+**With hook enabled, chain commands in one shell:**
+
+```bash
+oc && dev  # navigates then starts dev server in the same shell
+```
+
+---
 
 ## License
 

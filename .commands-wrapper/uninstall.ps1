@@ -100,6 +100,39 @@ function Resolve-WrapperSyncCommand {
     return $null
 }
 
+function Test-PackageInstalled {
+    $candidates = @(
+        @{ exe = "py"; args = @("-3"); label = "py -3" },
+        @{ exe = "python"; args = @(); label = "python" }
+    )
+    $sawInterpreter = $false
+    $sawNotInstalled = $false
+
+    foreach ($candidate in $candidates) {
+        if (-not (Get-Command $candidate.exe -ErrorAction SilentlyContinue)) {
+            continue
+        }
+        $sawInterpreter = $true
+
+        & $candidate.exe @($candidate.args + @("-m", "pip", "show", "commands-wrapper")) | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+        if ($LASTEXITCODE -eq 1) {
+            $sawNotInstalled = $true
+            continue
+        }
+
+        throw "'$($candidate.label) -m pip show commands-wrapper' failed with exit code $LASTEXITCODE."
+    }
+
+    if ($sawInterpreter -and $sawNotInstalled) {
+        return $false
+    }
+
+    throw "Python 3 was not found in PATH."
+}
+
 $syncWarning = "Wrapper cleanup failed; continuing package uninstall."
 $scriptsDir = Get-PythonScriptsDir
 $syncCommand = Resolve-WrapperSyncCommand -ScriptsDir $scriptsDir
@@ -113,8 +146,12 @@ if ($syncCommand) {
     } catch {
         Write-Host $syncWarning -ForegroundColor Yellow
     }
-} else {
-    Write-Host $syncWarning -ForegroundColor Yellow
+}
+
+$isInstalled = Test-PackageInstalled
+if (-not $isInstalled) {
+    Write-Host "commands-wrapper is not installed." -ForegroundColor Gray
+    exit 0
 }
 
 Invoke-Python @("-m", "pip", "uninstall", "commands-wrapper", "-y")
