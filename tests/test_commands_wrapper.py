@@ -2188,6 +2188,34 @@ class CommandsWrapperTests(unittest.TestCase):
         sync_mock.assert_not_called()
         print_mock.assert_not_called()
 
+    def test_main_internal_resolve_prints_exact_command_name(self):
+        db = {
+            "oc": {
+                "description": "demo",
+                "steps": [{"command": "cd /tmp"}],
+            },
+            "oc login": {
+                "description": "demo",
+                "steps": [{"command": "echo wrapped"}],
+            },
+        }
+
+        with (
+            mock.patch.object(cw, "load_cmds", return_value=db),
+            mock.patch.object(cw, "sync_binaries") as sync_mock,
+            mock.patch.object(cw, "print") as print_mock,
+            mock.patch.object(
+                sys, "argv", ["commands-wrapper", "__resolve", "OC", "LOGIN"]
+            ),
+            mock.patch.dict(
+                os.environ, {"COMMANDS_WRAPPER_INTERNAL": "1"}, clear=False
+            ),
+        ):
+            cw.main()
+
+        sync_mock.assert_not_called()
+        print_mock.assert_called_once_with("oc login")
+
     @unittest.skipIf(os.name == "nt", "POSIX hook output only")
     def test_main_hook_outputs_dispatch_function_and_identifier_wrappers(self):
         wrappers = {
@@ -2212,6 +2240,10 @@ class CommandsWrapperTests(unittest.TestCase):
         printed_lines = [call.args[0] for call in print_mock.call_args_list]
         self.assertIn("__commands_wrapper_dispatch() {", printed_lines)
         self.assertIn(f"export {cw.HOOK_ACTIVE_ENV}=1", printed_lines)
+        self.assertIn(
+            '    __cw_resolved="$(COMMANDS_WRAPPER_INTERNAL=1 command commands-wrapper __resolve "$__cw_full_name" 2>/dev/null)" || return $?',
+            printed_lines,
+        )
         self.assertIn('oc() { __commands_wrapper_dispatch oc "$@"; }', printed_lines)
         self.assertIn("alias claw-doc=\"commands-wrapper 'claw doc'\"", printed_lines)
 
@@ -2891,6 +2923,70 @@ class CommandsWrapperTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertEqual(result.stdout.strip().splitlines()[-1], str(target))
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX shell")
+    def test_shell_hook_prefers_exact_multi_word_command_over_single_cd_followup(self):
+        if not Path("/bin/bash").is_file():
+            self.skipTest("/bin/bash not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "fake-bin"
+            fake_home = root / "home"
+            fake_xdg = root / "xdg"
+            start = root / "start"
+            target = root / "target"
+            fake_bin.mkdir(parents=True)
+            fake_home.mkdir(parents=True)
+            fake_xdg.mkdir(parents=True)
+            start.mkdir(parents=True)
+            target.mkdir(parents=True)
+
+            config_dir = fake_xdg / "commands-wrapper"
+            config_dir.mkdir(parents=True)
+            (config_dir / "commands.yaml").write_text(
+                "oc:\n"
+                "  description: cd omni-connector\n"
+                "  steps:\n"
+                f'    - command: "cd {target}"\n'
+                "oc login:\n"
+                "  description: opencode login\n"
+                "  steps:\n"
+                '    - command: "echo wrapped-login"\n',
+                encoding="utf-8",
+            )
+
+            _write_executable(
+                fake_bin / "commands-wrapper",
+                (f'#!/bin/sh\nexec "{sys.executable}" "{SCRIPT_PATH}" "$@"\n'),
+            )
+
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["XDG_CONFIG_HOME"] = str(fake_xdg)
+            env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+            command = (
+                "set -e; "
+                f"cd {shlex.quote(str(start))}; "
+                'eval "$(commands-wrapper hook)"; '
+                "oc login; "
+                "pwd"
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-lc", command],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("wrapped-login", result.stdout)
+            self.assertNotIn(
+                "Cannot possibly work without effective root", result.stdout
+            )
+            self.assertEqual(result.stdout.strip().splitlines()[-1], str(start))
 
     @unittest.skipIf(os.name == "nt", "requires POSIX shell")
     def test_uppercase_wrapper_alias_changes_directory_with_hook_integration(self):

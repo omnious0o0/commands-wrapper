@@ -3010,6 +3010,10 @@ def main():
         normalized_action == '__cd-target'
         and os.environ.get('COMMANDS_WRAPPER_INTERNAL', '').strip() == '1'
     )
+    internal_resolve_action = (
+        normalized_action == '__resolve'
+        and os.environ.get('COMMANDS_WRAPPER_INTERNAL', '').strip() == '1'
+    )
 
     command_files = find_yamls()
     promoted_local_commands = _promote_local_commands_to_global(command_files)
@@ -3079,6 +3083,7 @@ def main():
             'config',
         )
         and not internal_cd_target_action
+        and not internal_resolve_action
     ):
         sync_kwargs: Dict[str, Any] = {
             'report_conflicts': False,
@@ -3102,6 +3107,17 @@ def main():
 
         if destination:
             print(destination)
+        return
+
+    if internal_resolve_action:
+        command_name = " ".join(action_parts[1:]).strip()
+        if not command_name:
+            _error(f"Usage: {PRIMARY_WRAPPER} __resolve <command-name>")
+            sys.exit(1)
+
+        resolved_name = _resolve_command_name(command_name, db, lookup_index)
+        if resolved_name:
+            print(resolved_name)
         return
 
     if normalized_action == 'sync':
@@ -3166,6 +3182,16 @@ def main():
             print("  fi")
             print("  __cw_name=\"$1\"")
             print("  shift")
+            print("  if [ \"$#\" -gt 0 ]; then")
+            print("    __cw_full_name=\"$__cw_name $*\"")
+            print(
+                f"    __cw_resolved=\"$(COMMANDS_WRAPPER_INTERNAL=1 command {PRIMARY_WRAPPER} __resolve \"$__cw_full_name\" 2>/dev/null)\" || return $?"
+            )
+            print("    if [ -n \"$__cw_resolved\" ]; then")
+            print(f"      command {PRIMARY_WRAPPER} \"$__cw_name\" \"$@\"")
+            print("      return $?")
+            print("    fi")
+            print("  fi")
             print(
                 f"  __cw_target=\"$(COMMANDS_WRAPPER_INTERNAL=1 command {PRIMARY_WRAPPER} __cd-target \"$__cw_name\" 2>/dev/null)\" || return $?"
             )
