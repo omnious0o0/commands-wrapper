@@ -48,6 +48,17 @@ if _termios is not None:
         _termios.error,
     )
 
+SPAWN_PROCESS_EXCEPTIONS: Tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    subprocess.SubprocessError,
+)
+if PEXPECT_AVAILABLE:
+    SPAWN_PROCESS_EXCEPTIONS = (
+        *SPAWN_PROCESS_EXCEPTIONS,
+        pexpect.ExceptionPexpect,
+    )
+
 ANSI_PRIMARY = "\033[38;5;67m"
 ANSI_MUTED = "\033[38;5;244m"
 ANSI_SUCCESS = "\033[38;5;108m"
@@ -61,8 +72,11 @@ PRIMARY_WRAPPER = "commands-wrapper"
 SHORT_ALIAS = "cw"
 LEGACY_ALIAS = "command-wrapper"
 HOOK_ACTIVE_ENV = 'COMMANDS_WRAPPER_HOOK_ACTIVE'
+FIRST_LAUNCH_TIP_ENV = 'COMMANDS_WRAPPER_DISABLE_FIRST_LAUNCH_TIP'
 HOOK_BLOCK_START = '# >>> commands-wrapper hook >>>'
 HOOK_BLOCK_END = '# <<< commands-wrapper hook <<<'
+
+_WIZARD_STARTUP_STATUS: Optional[str] = None
 
 DEFAULT_UPDATE_TARBALL_URL = "https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz"
 UPDATE_TARBALL_URL = os.environ.get("COMMANDS_WRAPPER_UPDATE_URL", "").strip() or DEFAULT_UPDATE_TARBALL_URL
@@ -411,6 +425,35 @@ def _preferred_command_file_for_write() -> str:
         return local_candidates[0]
 
     return global_candidates[0]
+
+
+def _first_launch_tip_marker_path() -> str:
+    return os.path.join(_user_config_dir(), '.first-launch-tip-shown')
+
+
+def _consume_first_launch_tip() -> bool:
+    if _env_flag_enabled(FIRST_LAUNCH_TIP_ENV):
+        return False
+
+    marker_path = _first_launch_tip_marker_path()
+    parent = os.path.dirname(marker_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError:
+            return False
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(marker_path, flags, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+
+    with os.fdopen(fd, 'w', encoding='utf-8') as marker_file:
+        marker_file.write('shown\n')
+    return True
 
 
 def _shell_name() -> str:
@@ -1563,10 +1606,23 @@ def _consume_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
     if parent_pid <= 0:
         return None
 
+    pending_cwd = _peek_wrapper_cwd_context(parent_pid)
+    if not pending_cwd:
+        return None
+
+    _clear_wrapper_cwd_context(parent_pid)
+    return pending_cwd
+
+
+def _peek_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
+    if parent_pid <= 0:
+        return None
+
     context = _load_wrapper_cwd_context()
     _prune_wrapper_cwd_context(context)
-    entry = context.pop(str(parent_pid), None)
     _save_wrapper_cwd_context(context)
+
+    entry = context.get(str(parent_pid))
 
     if not isinstance(entry, dict):
         return None
@@ -1578,11 +1634,21 @@ def _consume_wrapper_cwd_context(parent_pid: int) -> Optional[str]:
     return cwd_value
 
 
+def _clear_wrapper_cwd_context(parent_pid: int) -> None:
+    if parent_pid <= 0:
+        return
+
+    context = _load_wrapper_cwd_context()
+    _prune_wrapper_cwd_context(context)
+    context.pop(str(parent_pid), None)
+    _save_wrapper_cwd_context(context)
+
+
 def _apply_wrapper_cwd_context(parent_pid: Optional[int]) -> None:
     if not parent_pid:
         return
 
-    pending_cwd = _consume_wrapper_cwd_context(parent_pid)
+    pending_cwd = _peek_wrapper_cwd_context(parent_pid)
     if not pending_cwd:
         return
 
@@ -1595,6 +1661,8 @@ def _apply_wrapper_cwd_context(parent_pid: Optional[int]) -> None:
         os.chdir(pending_cwd)
     except OSError:
         return
+
+    _clear_wrapper_cwd_context(parent_pid)
 
     if previous:
         os.environ['OLDPWD'] = previous
@@ -2079,6 +2147,8 @@ def _wizard_edit_command(win, name: str) -> str:
 
 
 def _wizard_main(win):
+    global _WIZARD_STARTUP_STATUS
+
     _configure_escape_key_delay()
     _init_colors()
     try:
@@ -2089,7 +2159,8 @@ def _wizard_main(win):
     win.keypad(True)
     win.timeout(-1)
 
-    status = ""
+    status = _WIZARD_STARTUP_STATUS or ""
+    _WIZARD_STARTUP_STATUS = None
     startup_sync_done = False
     while True:
         db_load_warnings: List[str] = []
@@ -2164,8 +2235,10 @@ def _wizard_main(win):
 
 
 
-def _run_basic_wizard() -> None:
+def _run_basic_wizard(startup_status: str = "") -> None:
     print(f"{ANSI_BOLD}{HEADER_TITLE}{ANSI_RESET}")
+    if startup_status:
+        print(startup_status.replace('INFO: ', ''))
     print("Terminal UI is unavailable on this platform or shell.")
     print("Use non-interactive commands instead:")
     print(f"  {PRIMARY_WRAPPER} add --yaml <<EOF")
@@ -2189,9 +2262,12 @@ def _strip_add_yaml_flag(argv: List[str]) -> Tuple[List[str], bool]:
     return filtered, has_yaml_flag
 
 
-def run_wizard():
+def run_wizard(startup_status: str = ""):
+    global _WIZARD_STARTUP_STATUS
+
+    _WIZARD_STARTUP_STATUS = startup_status or None
     if not _has_tui_support():
-        _run_basic_wizard()
+        _run_basic_wizard(startup_status=startup_status)
         return
 
     try:
@@ -2506,9 +2582,12 @@ def _finalize_process(proc: ProcessAdapter) -> None:
 
 
 def _spawn_process(command: str, timeout: Optional[int]) -> ProcessAdapter:
-    if PEXPECT_AVAILABLE and os.name != 'nt':
-        return PExpectProcessAdapter(command, timeout)
-    return SubprocessProcessAdapter(command, timeout)
+    try:
+        if PEXPECT_AVAILABLE and os.name != 'nt':
+            return PExpectProcessAdapter(command, timeout)
+        return SubprocessProcessAdapter(command, timeout)
+    except SPAWN_PROCESS_EXCEPTIONS as exc:
+        raise ValueError(f"unable to start command process: {exc}") from exc
 
 
 def run_step(proc: Optional[ProcessAdapter], ctx: Dict[str, Any], timeout: Optional[int]):
@@ -2871,13 +2950,153 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _command_file_snapshot_paths() -> List[str]:
+    snapshot_paths = set(find_yamls())
+    snapshot_roots = {
+        _legacy_config_dir(),
+        _user_config_dir(),
+        os.getcwd(),
+    }
+
+    for root in snapshot_roots:
+        for candidate in _command_file_candidates(root):
+            snapshot_paths.add(candidate)
+
+    return sorted(snapshot_paths)
+
+
+def _command_file_inventory_directories() -> List[str]:
+    cwd = os.getcwd()
+    directories = {
+        _legacy_config_dir(),
+        _user_config_dir(),
+        cwd,
+        os.path.join(cwd, '.commands-wrapper'),
+        os.path.join(cwd, 'commands-wrapper'),
+    }
+    return sorted(directories)
+
+
+def _snapshot_yaml_directory_inventory(directories: List[str]) -> Dict[str, List[str]]:
+    inventory: Dict[str, List[str]] = {}
+    for directory in directories:
+        files = _scan_yaml_files(directory)
+        inventory[directory] = sorted(
+            os.path.realpath(path)
+            for path in files
+            if os.path.isfile(path)
+        )
+    return inventory
+
+
+def _detect_new_yaml_inventory_files(
+    snapshot_inventory: Dict[str, List[str]],
+) -> List[str]:
+    created: List[str] = []
+    for directory, before_paths in snapshot_inventory.items():
+        before_set = set(before_paths)
+        current_files = _scan_yaml_files(directory)
+        current_paths = [
+            os.path.realpath(path)
+            for path in current_files
+            if os.path.isfile(path)
+        ]
+        for path in current_paths:
+            if path not in before_set:
+                created.append(path)
+
+    created.sort()
+    return list(dict.fromkeys(created))
+
+
+def _snapshot_command_files(files: List[str]) -> Dict[str, Tuple[bool, Optional[str]]]:
+    snapshots: Dict[str, Tuple[bool, Optional[str]]] = {}
+    for path in files:
+        existed = os.path.isfile(path)
+        if not existed:
+            snapshots[path] = (False, None)
+            continue
+        try:
+            with open(path, encoding='utf-8') as fd:
+                snapshots[path] = (True, fd.read())
+        except OSError:
+            snapshots[path] = (True, None)
+    return snapshots
+
+
+def _restore_command_file_snapshots(
+    snapshots: Dict[str, Tuple[bool, Optional[str]]],
+    *,
+    created_files: Optional[List[str]] = None,
+) -> None:
+    for path, (existed, content) in snapshots.items():
+        if not existed or content is None:
+            continue
+
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                continue
+        try:
+            _atomic_write_text(path, content)
+        except OSError:
+            continue
+
+    if created_files:
+        for path in created_files:
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+
+
+def _detect_unexpected_command_file_changes(
+    snapshots: Dict[str, Tuple[bool, Optional[str]]],
+) -> Tuple[List[str], List[str]]:
+    changed: List[str] = []
+    created: List[str] = []
+
+    for path, (existed, original) in snapshots.items():
+        exists_now = os.path.isfile(path)
+        if not existed:
+            if exists_now:
+                created.append(path)
+            continue
+
+        if not exists_now:
+            changed.append(path)
+            continue
+
+        if original is None:
+            continue
+
+        try:
+            with open(path, encoding='utf-8') as fd:
+                current = fd.read()
+        except OSError:
+            changed.append(path)
+            continue
+
+        if current != original:
+            changed.append(path)
+    changed.sort()
+    created.sort()
+    return changed, created
+
+
 def _prepare_update_source() -> Tuple[str, Optional[str]]:
     expected_sha256 = os.environ.get('COMMANDS_WRAPPER_UPDATE_SHA256', '').strip().lower()
     if not expected_sha256:
         return UPDATE_TARBALL_URL, None
 
     if len(expected_sha256) != 64 or any(c not in '0123456789abcdef' for c in expected_sha256):
-        raise ValueError('invalid COMMANDS_WRAPPER_UPDATE_SHA256 value')
+        raise ValueError(
+            'invalid COMMANDS_WRAPPER_UPDATE_SHA256 value (expected 64 lowercase hex characters)'
+        )
 
     fd, archive_path = tempfile.mkstemp(prefix='commands-wrapper-update-', suffix='.tar.gz')
     os.close(fd)
@@ -2901,7 +3120,10 @@ def _prepare_update_source() -> Tuple[str, Optional[str]]:
             os.remove(archive_path)
         except OSError:
             pass
-        raise ValueError('update archive checksum mismatch')
+        raise ValueError(
+            'update archive checksum mismatch '
+            f'for {UPDATE_TARBALL_URL}: expected {expected_sha256[:12]}..., got {actual_sha256[:12]}...'
+        )
 
     return archive_path, archive_path
 
@@ -2938,6 +3160,9 @@ def _reexec_if_stale_build_script() -> None:
 
 def _auto_update():
     print(f"{ANSI_MUTED}Updating from GitHub...{ANSI_RESET}")
+    snapshot_paths = _command_file_snapshot_paths()
+    command_file_snapshots = _snapshot_command_files(snapshot_paths)
+    directory_inventory = _snapshot_yaml_directory_inventory(_command_file_inventory_directories())
     try:
         update_source, cleanup_path = _prepare_update_source()
     except ValueError as exc:
@@ -2959,7 +3184,27 @@ def _auto_update():
                 sync_load_warnings,
                 prune_stale=False,
             )
-            if _report_sync_messages(sync_errors):
+            sync_has_errors = _report_sync_messages(sync_errors)
+
+            changed_files, created_files = _detect_unexpected_command_file_changes(command_file_snapshots)
+            created_inventory_files = _detect_new_yaml_inventory_files(directory_inventory)
+            unexpected_created_files = list(dict.fromkeys([*created_files, *created_inventory_files]))
+
+            if changed_files or unexpected_created_files:
+                _restore_command_file_snapshots(
+                    command_file_snapshots,
+                    created_files=unexpected_created_files,
+                )
+                unexpected_files = list(dict.fromkeys([*changed_files, *unexpected_created_files]))
+                changed_preview = ", ".join(unexpected_files[:3])
+                if len(unexpected_files) > 3:
+                    changed_preview += f" (+{len(unexpected_files) - 3} more)"
+                _error(
+                    "update unexpectedly modified command files; restored original content: "
+                    f"{changed_preview}"
+                )
+                return_code = 1
+            elif sync_has_errors:
                 return_code = 1
             else:
                 _ok("Update complete.")
@@ -2998,7 +3243,12 @@ def main():
     action_parts = args.action
 
     if not action_parts:
-        run_wizard()
+        startup_tip = ""
+        if _consume_first_launch_tip():
+            startup_tip = (
+                f"INFO: Tip: use '{SHORT_ALIAS}' to launch {PRIMARY_WRAPPER} from anywhere."
+            )
+        run_wizard(startup_status=startup_tip)
         return
 
     action = action_parts[0]
@@ -3006,6 +3256,7 @@ def main():
     full_action = " ".join(action_parts)
     wrapper_entry = os.environ.get('COMMANDS_WRAPPER_WRAPPER_ENTRY', '').strip() == '1'
     wrapper_parent_pid = os.getppid() if wrapper_entry else None
+    is_update_action = normalized_action in ('update', 'upd')
     internal_cd_target_action = (
         normalized_action == '__cd-target'
         and os.environ.get('COMMANDS_WRAPPER_INTERNAL', '').strip() == '1'
@@ -3016,9 +3267,11 @@ def main():
     )
 
     command_files = find_yamls()
-    promoted_local_commands = _promote_local_commands_to_global(command_files)
-    if promoted_local_commands:
-        command_files = find_yamls()
+    promoted_local_commands: List[str] = []
+    if not is_update_action:
+        promoted_local_commands = _promote_local_commands_to_global(command_files)
+        if promoted_local_commands:
+            command_files = find_yamls()
 
     load_warnings: List[str] = []
     db = load_cmds(command_files, warnings=load_warnings)
@@ -3084,6 +3337,7 @@ def main():
         )
         and not internal_cd_target_action
         and not internal_resolve_action
+        and not is_update_action
     ):
         sync_kwargs: Dict[str, Any] = {
             'report_conflicts': False,
