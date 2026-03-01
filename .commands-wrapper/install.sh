@@ -18,39 +18,129 @@ FISH_PATH_BLOCK_END='# <<< commands-wrapper fish path <<<'
 
 TOTAL_STEPS=9
 CURRENT_STEP=0
+UI_RUNTIME_READY=0
 
 SOURCE_URL="${COMMANDS_WRAPPER_SOURCE_URL:-https://github.com/omnious0o0/commands-wrapper/archive/refs/heads/main.tar.gz}"
 SOURCE_SHA256="${COMMANDS_WRAPPER_SOURCE_SHA256:-}"
 
+ensure_ui_runtime() {
+    if [ "$UI_RUNTIME_READY" = "1" ]; then
+        return 0
+    fi
+
+    if python3 -c "import importlib.util, sys; missing=[p for p in ('rich','pyfiglet') if importlib.util.find_spec(p) is None]; raise SystemExit(1 if missing else 0)" >/dev/null 2>&1
+    then
+        UI_RUNTIME_READY=1
+        return 0
+    fi
+
+    if python3 -m pip install rich pyfiglet --break-system-packages >/dev/null 2>&1 || \
+        python3 -m pip install rich pyfiglet >/dev/null 2>&1; then
+        UI_RUNTIME_READY=1
+        return 0
+    fi
+
+    return 1
+}
+
+ui_render() {
+    local mode="$1"
+    shift || true
+
+    local ui_code
+    ui_code="$(cat <<'PY'
+import sys
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress_bar import ProgressBar
+import pyfiglet
+
+console = Console()
+mode = sys.argv[1]
+
+if mode == "logo":
+    logo = pyfiglet.figlet_format("commands-wrapper", font="ansi_shadow")
+    console.print(Panel(f"[bold cyan]{logo}[/bold cyan]", border_style="cyan", padding=(0, 2)))
+elif mode == "step":
+    current = int(sys.argv[2])
+    total = int(sys.argv[3])
+    label = sys.argv[4]
+    console.print(f"[cyan][{current}/{total}][/cyan] [bold]{label}[/bold]")
+    console.print(ProgressBar(total=total, completed=current, width=36, complete_style="cyan"))
+elif mode == "ok":
+    console.print("[green]✓[/green] [green]Done[/green]")
+elif mode == "warn":
+    console.print(f"[yellow]⚠[/yellow] [yellow]{sys.argv[2]}[/yellow]")
+elif mode == "error":
+    console.print(f"[red]✗[/red] [red]{sys.argv[2]}[/red]")
+elif mode == "info":
+    console.print(f"[cyan]{sys.argv[2]}[/cyan]")
+elif mode == "detail":
+    console.print(f"[dim]{sys.argv[2]}[/dim]")
+elif mode == "success-panel":
+    version = sys.argv[2]
+    body = "\n".join([
+        f"[green]✓ commands-wrapper {version} installed[/green]",
+        "",
+        "[cyan]cw[/cyan]                 launch",
+        "[cyan]cw --update[/cyan]        update",
+        "[cyan]cw --help[/cyan]          all commands",
+    ])
+    console.print(Panel(body, border_style="green", padding=(1, 2)))
+PY
+)"
+
+    python3 -c "$ui_code" "$mode" "$@"
+}
+
+ui_emit() {
+    local mode="$1"
+    shift || true
+
+    local rendered
+    if ! rendered="$(ui_render "$mode" "$@" 2>/dev/null)"; then
+        return 1
+    fi
+
+    if [ -z "$rendered" ]; then
+        return 1
+    fi
+
+    local probe="${1:-}"
+    case "$mode" in
+        step|warn|error|info|detail)
+            if [ -n "$probe" ] && [[ "$rendered" != *"$probe"* ]]; then
+                return 1
+            fi
+            ;;
+        ok)
+            if [[ "$rendered" != *"Done"* ]] && [[ "$rendered" != *"✓"* ]]; then
+                return 1
+            fi
+            ;;
+        success-panel)
+            if [[ "$rendered" != *"cw --update"* ]]; then
+                return 1
+            fi
+            ;;
+    esac
+
+    printf '%s\n' "$rendered"
+    return 0
+}
+
 print_logo() {
-    printf '%s\n' \
-        '  ____ ___  __  __ __  __    _    _   _ ____  ____' \
-        ' / ___/ _ \|  \/  |  \/  |  / \  | \ | |  _ \/ ___|' \
-        '| |  | | | | |\/| | |\/| | / _ \ |  \| | | | \___ \' \
-        '| |__| |_| | |  | | |  | |/ ___ \| |\  | |_| |___) |' \
-        ' \____\___/|_|  |_|_|  |_/_/   \_\_| \_|____/|____/' \
-        '' \
-        '__        _______    _    ____  ____  _____ ____' \
-        '\ \      / /_   _|  / \  |  _ \|  _ \| ____|  _ \' \
-        ' \ \ /\ / /  | |   / _ \ | |_) | |_) |  _| | |_) |' \
-        '  \ V  V /   | |  / ___ \|  __/|  __/| |___|  _ <' \
-        '   \_/\_/    |_| /_/   \_\_|   |_|   |_____|_| \_\'
+    if ! ui_emit logo; then
+        printf "${BLUE}commands-wrapper${RESET}\n"
+    fi
 }
 
 draw_progress() {
     local label="$1"
-    local width=28
-    local filled=$((CURRENT_STEP * width / TOTAL_STEPS))
-    local empty=$((width - filled))
-    local bar
-    local filled_bar
-    local empty_bar
-    filled_bar="$(printf '%*s' "$filled" '')"
-    empty_bar="$(printf '%*s' "$empty" '')"
-    filled_bar="${filled_bar// /#}"
-    empty_bar="${empty_bar// /-}"
-    bar="${filled_bar}${empty_bar}"
-    printf "${BLUE}[%s] (%d/%d)${RESET} %s\n" "$bar" "$CURRENT_STEP" "$TOTAL_STEPS" "$label"
+    if ! ui_emit step "$CURRENT_STEP" "$TOTAL_STEPS" "$label"; then
+        printf "${BLUE}[%d/%d]${RESET} %s\n" "$CURRENT_STEP" "$TOTAL_STEPS" "$label"
+    fi
 }
 
 start_step() {
@@ -59,15 +149,23 @@ start_step() {
 }
 
 step_ok() {
-    printf "${GREEN}  OK${RESET}\n"
+    if ! ui_emit ok; then
+        printf "${GREEN}OK${RESET}\n"
+    fi
 }
 
 step_warn() {
-    printf "${YELLOW}  WARN:${RESET} %s\n" "$1"
+    if ! ui_emit warn "$1"; then
+        printf "${YELLOW}WARN:${RESET} %s\n" "$1"
+    fi
 }
 
 die() {
-    printf "${RED}ERROR:${RESET} %s\n" "$1" >&2
+    if [ "$UI_RUNTIME_READY" = "1" ] && ui_emit error "$1" >&2; then
+        :
+    else
+        printf "${RED}ERROR:${RESET} %s\n" "$1" >&2
+    fi
     exit 1
 }
 
@@ -435,16 +533,16 @@ run_sync_with_retry() {
     fi
 
     if [ -f "$sync_log_first" ]; then
-        printf "${RED}Sync attempt output:${RESET}\n" >&2
+        ui_emit warn "Sync attempt output:" || printf '%s\n' "Sync attempt output:"
         while IFS= read -r log_line; do
-            printf '%s\n' "$log_line" >&2
+            ui_emit detail "$log_line" || printf '%s\n' "$log_line"
         done < "$sync_log_first"
     fi
 
     if [ -f "$sync_log_second" ]; then
-        printf "${RED}Retry sync output:${RESET}\n" >&2
+        ui_emit warn "Retry sync output:" || printf '%s\n' "Retry sync output:"
         while IFS= read -r log_line; do
-            printf '%s\n' "$log_line" >&2
+            ui_emit detail "$log_line" || printf '%s\n' "$log_line"
         done < "$sync_log_second"
     fi
 
@@ -452,8 +550,21 @@ run_sync_with_retry() {
     return 1
 }
 
+if ! command -v python3 >/dev/null 2>&1; then
+    printf "${RED}ERROR:${RESET} python3 was not found in PATH.\n" >&2
+    exit 1
+fi
+if ! python3 -m pip --version >/dev/null 2>&1; then
+    printf "${RED}ERROR:${RESET} python3 is available but pip is missing or broken.\n" >&2
+    exit 1
+fi
+if ! ensure_ui_runtime; then
+    printf "${RED}ERROR:${RESET} failed to install installer UI dependencies (rich, pyfiglet).\n" >&2
+    exit 1
+fi
+
 print_logo
-printf "${BLUE}Installing commands-wrapper${RESET}\n\n"
+ui_emit info "Installing commands-wrapper" || printf "${BLUE}Installing commands-wrapper${RESET}\n"
 
 INSTALL_CWD="$(pwd)"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -628,5 +739,10 @@ if ! "$BIN_PATH" --help >/dev/null 2>&1; then
 fi
 step_ok
 
-printf "\n${GREEN}commands-wrapper is installed and self-healed.${RESET}\n"
-printf "${GRAY}Use '${SHORT_ALIAS}' or '${PRIMARY_WRAPPER}' from any directory.${RESET}\n"
+INSTALLED_AFTER="$(installed_package_version || true)"
+if [ -z "$INSTALLED_AFTER" ]; then
+    INSTALLED_AFTER="installed"
+fi
+if ! ui_emit success-panel "$INSTALLED_AFTER"; then
+    printf "${GREEN}commands-wrapper is installed and self-healed.${RESET}\n"
+fi

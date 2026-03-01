@@ -6,44 +6,189 @@ $ShortAlias = "cw"
 $StepTotal = 9
 $StepCurrent = 0
 
-function Write-Logo {
-@'
-  ____                                          _
- / ___|___  _ __ ___  _ __ ___   __ _ _ __   __| |___
-| |   / _ \| '_ ` _ \| '_ ` _ \ / _` | '_ \ / _` / __|
-| |__| (_) | | | | | | | | | | | (_| | | | | (_| \__ \
- \____\___/|_| |_| |_|_| |_| |_|\__,_|_| |_|\__,_|___/
+function Invoke-RichUi {
+    param(
+        [string]$Mode,
+        [string]$Message = "",
+        [int]$Current = 0,
+        [int]$Total = 0,
+        [string]$Version = ""
+    )
 
-__        __
-\ \      / / __ __ _ _ __  _ __   ___ _ __
- \ \ /\ / / '__/ _` | '_ \| '_ \ / _ \ '__|
-  \ V  V /| | | (_| | |_) | |_) |  __/ |
-   \_/\_/ |_|  \__,_| .__/| .__/ \___|_|
-                    |_|   |_|
-'@ | Write-Host -ForegroundColor Cyan
+    $code = @'
+import sys
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress_bar import ProgressBar
+import pyfiglet
+
+mode = sys.argv[1]
+message = sys.argv[2]
+current = int(sys.argv[3])
+total = int(sys.argv[4])
+version = sys.argv[5]
+
+console = Console()
+
+if mode == "logo":
+    logo = pyfiglet.figlet_format("commands-wrapper", font="ansi_shadow")
+    console.print(Panel(f"[bold cyan]{logo}[/bold cyan]", border_style="cyan", padding=(0, 2)))
+elif mode == "step":
+    console.print(f"[cyan][{current}/{total}][/cyan] [bold]{message}[/bold]")
+    console.print(ProgressBar(total=total, completed=current, width=36, complete_style="cyan"))
+elif mode == "ok":
+    console.print("[green]✓[/green] [green]Done[/green]")
+elif mode == "warn":
+    console.print(f"[yellow]⚠[/yellow] [yellow]{message}[/yellow]")
+elif mode == "error":
+    console.print(f"[red]✗[/red] [red]{message}[/red]")
+elif mode == "info":
+    console.print(f"[cyan]{message}[/cyan]")
+elif mode == "success-panel":
+    body = "\n".join([
+        f"[green]✓ commands-wrapper {version} installed[/green]",
+        "",
+        "[cyan]cw[/cyan]                 launch",
+        "[cyan]cw --update[/cyan]        update",
+        "[cyan]cw --help[/cyan]          all commands",
+    ])
+    console.print(Panel(body, border_style="green", padding=(1, 2)))
+'@
+
+    $args = @("-c", $code, $Mode, $Message, $Current.ToString(), $Total.ToString(), $Version)
+    $uiOutput = $null
+    $uiExitCode = $null
+    $isExpectedOutput = {
+        param(
+            [string]$ModeValue,
+            [string]$OutputText,
+            [string]$Probe
+        )
+
+        switch ($ModeValue) {
+            "step" { return $OutputText.Contains($Probe) }
+            "warn" { return $OutputText.Contains($Probe) }
+            "error" { return $OutputText.Contains($Probe) }
+            "info" { return $OutputText.Contains($Probe) }
+            "detail" { return $OutputText.Contains($Probe) }
+            "ok" { return $OutputText.Contains("Done") -or $OutputText.Contains("✓") }
+            "success-panel" { return $OutputText.Contains("cw --update") }
+            default { return $OutputText.Length -gt 0 }
+        }
+    }
+
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $uiOutput = & py -3 @args 2>$null
+        $uiExitCode = $LASTEXITCODE
+        if ($uiExitCode -eq 0 -and $uiOutput) {
+            $outputText = ($uiOutput -join "`n")
+            if (& $isExpectedOutput $Mode $outputText $Message) {
+                $uiOutput | ForEach-Object { Write-Host $_ }
+                return
+            }
+        }
+    }
+
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $uiOutput = & python @args 2>$null
+        $uiExitCode = $LASTEXITCODE
+        if ($uiExitCode -eq 0 -and $uiOutput) {
+            $outputText = ($uiOutput -join "`n")
+            if (& $isExpectedOutput $Mode $outputText $Message) {
+                $uiOutput | ForEach-Object { Write-Host $_ }
+                return
+            }
+        }
+    }
+
+    switch ($Mode) {
+        "logo" {
+            Write-Host "commands-wrapper" -ForegroundColor Cyan
+        }
+        "step" {
+            Write-Host "[$Current/$Total] $Message" -ForegroundColor Cyan
+        }
+        "ok" {
+            Write-Host "Done" -ForegroundColor Green
+        }
+        "warn" {
+            Write-Host "WARN: $Message" -ForegroundColor Yellow
+        }
+        "error" {
+            Write-Host "ERROR: $Message" -ForegroundColor Red
+        }
+        "info" {
+            Write-Host $Message -ForegroundColor Cyan
+        }
+        "success-panel" {
+            Write-Host "commands-wrapper is installed and self-healed." -ForegroundColor Green
+            Write-Host "Use 'cw' or 'commands-wrapper' from any directory." -ForegroundColor Gray
+        }
+        default {
+            if ($Message) {
+                Write-Host $Message
+            }
+        }
+    }
+}
+
+function Ensure-UiRuntime {
+    $checkCode = @'
+import importlib.util
+import sys
+
+missing = [pkg for pkg in ("rich", "pyfiglet") if importlib.util.find_spec(pkg) is None]
+raise SystemExit(1 if missing else 0)
+'@
+
+    $checkExit = $null
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3 -c $checkCode | Out-Null
+        $checkExit = $LASTEXITCODE
+        if ($checkExit -eq 0) {
+            return
+        }
+    }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        & python -c $checkCode | Out-Null
+        $checkExit = $LASTEXITCODE
+        if ($checkExit -eq 0) {
+            return
+        }
+    }
+
+    try {
+        Invoke-Python @("-m", "pip", "install", "rich", "pyfiglet", "--break-system-packages")
+        return
+    } catch {
+        Invoke-Python @("-m", "pip", "install", "rich", "pyfiglet")
+    }
+}
+
+function Write-Logo {
+    Invoke-RichUi -Mode "logo"
 }
 
 function Start-Step {
     param([string]$Message)
 
     $script:StepCurrent += 1
-    $percent = [int](($script:StepCurrent * 100) / $script:StepTotal)
-    Write-Progress -Activity "Installing commands-wrapper" -Status $Message -PercentComplete $percent
-    Write-Host "[$($script:StepCurrent)/$($script:StepTotal)] $Message" -ForegroundColor Cyan
+    Invoke-RichUi -Mode "step" -Message $Message -Current $script:StepCurrent -Total $script:StepTotal
 }
 
 function Complete-Step {
-    Write-Host "  OK" -ForegroundColor Green
+    Invoke-RichUi -Mode "ok"
 }
 
 function Warn-Step {
     param([string]$Message)
-    Write-Host "  WARN: $Message" -ForegroundColor Yellow
+    Invoke-RichUi -Mode "warn" -Message $Message
 }
 
 function Fail-Install {
     param([string]$Message)
-    Write-Host "ERROR: $Message" -ForegroundColor Red
+    Invoke-RichUi -Mode "error" -Message $Message
     throw $Message
 }
 
@@ -473,8 +618,9 @@ function Ensure-GlobalConfigTemplate {
     }
 }
 
+Ensure-UiRuntime
 Write-Logo
-Write-Host "Installing commands-wrapper`n" -ForegroundColor Cyan
+Invoke-RichUi -Mode "info" -Message "Installing commands-wrapper"
 
 $repoRoot = $null
 if ($MyInvocation.MyCommand.Path) {
@@ -627,6 +773,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 Complete-Step
 
-Write-Progress -Activity "Installing commands-wrapper" -Completed
-Write-Host "`ncommands-wrapper is installed and self-healed." -ForegroundColor Green
-Write-Host "Use '$ShortAlias' or '$PrimaryWrapper' from any directory." -ForegroundColor Gray
+$installedAfter = Get-InstalledPackageVersion
+if (-not $installedAfter) {
+    $installedAfter = "installed"
+}
+Invoke-RichUi -Mode "success-panel" -Version $installedAfter
